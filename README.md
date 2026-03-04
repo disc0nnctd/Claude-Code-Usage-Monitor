@@ -22,9 +22,9 @@ Each bar shows the current utilization percentage and a countdown until the rate
 2. Sends a minimal API request to the Anthropic Messages API
 3. Parses rate limit headers (`anthropic-ratelimit-unified-*`) from the response
 4. Renders the widget using Win32 GDI, embedded as a child window of the taskbar
-5. Polls every 15 minutes (adjustable) and updates countdown timers between polls
+5. Polls every 15 minutes by default (adjustable via context menu) and updates countdown timers between polls
 
-The widget automatically detects dark/light mode from Windows system settings.
+The widget automatically detects dark/light mode from Windows system settings. You can drag the left divider to reposition the widget along the taskbar. Settings (position and poll frequency) are persisted to `%APPDATA%\ClaudeCodeUsageMonitor\settings.json`.
 
 ## Requirements
 
@@ -42,7 +42,10 @@ The binary will be at `target/release/claude-code-usage-monitor.exe`.
 
 ## Usage
 
-Run the executable — the widget appears in your taskbar. Right-click for a context menu with **Refresh**, **Update Frequency** and **Exit** options.
+Run the executable — the widget appears in your taskbar.
+
+- **Drag** the left divider to reposition the widget along the taskbar
+- **Right-click** for a context menu with **Refresh**, **Update Frequency**, **Settings** (Start with Windows, Reset Position), and **Exit**
 
 ## Project structure
 
@@ -63,6 +66,6 @@ Pre-built Windows executables are available on the [Releases](../../releases) pa
 New releases are published automatically when a version tag is pushed:
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+git tag v1.0.0
+git push origin v1.0.0
 ```

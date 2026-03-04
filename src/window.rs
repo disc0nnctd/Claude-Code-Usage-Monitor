@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -7,6 +8,7 @@ use windows::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW
 use windows::Win32::System::Registry::*;
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::Accessibility::HWINEVENTHOOK;
+use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::PCWSTR;
 
@@ -49,6 +51,11 @@ struct AppState {
     poll_interval_ms: u32,
     retry_count: u32,
     last_poll_ok: bool,
+
+    tray_offset: i32,
+    dragging: bool,
+    drag_start_mouse_x: i32,
+    drag_start_offset: i32,
 }
 
 const RETRY_BASE_MS: u32 = 30_000; // 30 seconds
@@ -64,6 +71,9 @@ const IDM_FREQ_5MIN: u16 = 11;
 const IDM_FREQ_15MIN: u16 = 12;
 const IDM_FREQ_1HOUR: u16 = 13;
 const IDM_START_WITH_WINDOWS: u16 = 20;
+const IDM_RESET_POSITION: u16 = 30;
+
+const DIVIDER_HIT_ZONE: i32 = 13; // LEFT_DIVIDER_W + DIVIDER_RIGHT_MARGIN
 
 unsafe impl Send for AppState {}
 
@@ -74,6 +84,57 @@ fn lock_state() -> MutexGuard<'static, Option<AppState>> {
     STATE.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+
+fn settings_path() -> PathBuf {
+    let appdata = std::env::var("APPDATA").unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(appdata)
+        .join("ClaudeCodeUsageMonitor")
+        .join("settings.json")
+}
+
+fn parse_json_i32(content: &str, key: &str) -> Option<i32> {
+    let needle = format!("\"{}\"", key);
+    let pos = content.find(&needle)?;
+    let rest = &content[pos + needle.len()..];
+    let colon = rest.find(':')?;
+    let num_str: String = rest[colon + 1..]
+        .trim()
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '-')
+        .collect();
+    num_str.parse().ok()
+}
+
+fn load_settings() -> (i32, u32) {
+    let content = match std::fs::read_to_string(settings_path()) {
+        Ok(c) => c,
+        Err(_) => return (0, POLL_15_MIN),
+    };
+    let tray_offset = parse_json_i32(&content, "tray_offset").unwrap_or(0);
+    let poll_interval = parse_json_i32(&content, "poll_interval_ms")
+        .map(|v| v as u32)
+        .unwrap_or(POLL_15_MIN);
+    (tray_offset, poll_interval)
+}
+
+fn save_settings(tray_offset: i32, poll_interval_ms: u32) {
+    let path = settings_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let json = format!(
+        "{{\n  \"tray_offset\": {},\n  \"poll_interval_ms\": {}\n}}",
+        tray_offset, poll_interval_ms
+    );
+    let _ = std::fs::write(path, json);
+}
+
+fn save_state_settings() {
+    let state = lock_state();
+    if let Some(s) = state.as_ref() {
+        save_settings(s.tray_offset, s.poll_interval_ms);
+    }
+}
 
 const STARTUP_REGISTRY_PATH: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const STARTUP_REGISTRY_KEY: &str = "ClaudeCodeUsageMonitor";
@@ -273,6 +334,7 @@ pub fn run() {
 
         let is_dark = theme::is_dark_mode();
         let mut embedded = false;
+        let (saved_offset, saved_poll_interval) = load_settings();
 
         {
             let mut state = lock_state();
@@ -288,9 +350,13 @@ pub fn run() {
                 weekly_percent: 0.0,
                 weekly_text: "--".to_string(),
                 data: None,
-                poll_interval_ms: POLL_15_MIN,
+                poll_interval_ms: saved_poll_interval,
                 retry_count: 0,
                 last_poll_ok: false,
+                tray_offset: saved_offset,
+                dragging: false,
+                drag_start_mouse_x: 0,
+                drag_start_offset: 0,
             });
         }
 
@@ -737,8 +803,14 @@ fn position_at_taskbar() {
         None => return,
     };
 
+    // Don't fight the user's drag
+    if s.dragging {
+        return;
+    }
+
     let hwnd = s.hwnd.to_hwnd();
     let embedded = s.embedded;
+    let tray_offset = s.tray_offset;
 
     let taskbar_hwnd = match s.taskbar_hwnd {
         Some(h) => h,
@@ -763,12 +835,12 @@ fn position_at_taskbar() {
 
     if embedded {
         // Child window: coordinates relative to parent (taskbar)
-        let x = tray_left - taskbar_rect.left - widget_width;
+        let x = tray_left - taskbar_rect.left - widget_width - tray_offset;
         let y = (taskbar_height - WIDGET_HEIGHT) / 2;
         native_interop::move_window(hwnd, x, y, widget_width, WIDGET_HEIGHT);
     } else {
         // Topmost popup: screen coordinates
-        let x = tray_left - widget_width;
+        let x = tray_left - widget_width - tray_offset;
         let y = taskbar_rect.top + (taskbar_height - WIDGET_HEIGHT) / 2;
         native_interop::move_window(hwnd, x, y, widget_width, WIDGET_HEIGHT);
     }
@@ -877,6 +949,141 @@ unsafe extern "system" fn wnd_proc(
             schedule_countdown_timer();
             LRESULT(0)
         }
+        WM_SETCURSOR => {
+            let is_dragging = {
+                let state = lock_state();
+                state.as_ref().map(|s| s.dragging).unwrap_or(false)
+            };
+            // Always show resize cursor while dragging or when hovering divider zone
+            let hit_test = (lparam.0 & 0xFFFF) as u16;
+            if is_dragging {
+                let cursor = LoadCursorW(HINSTANCE::default(), IDC_SIZEWE)
+                    .unwrap_or_default();
+                SetCursor(cursor);
+                return LRESULT(1);
+            }
+            if hit_test == 1 { // HTCLIENT
+                let mut pt = POINT::default();
+                let _ = GetCursorPos(&mut pt);
+                let _ = ScreenToClient(hwnd, &mut pt);
+                if pt.x < DIVIDER_HIT_ZONE {
+                    let cursor = LoadCursorW(HINSTANCE::default(), IDC_SIZEWE)
+                        .unwrap_or_default();
+                    SetCursor(cursor);
+                    return LRESULT(1);
+                }
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+        WM_LBUTTONDOWN => {
+            let client_x = (lparam.0 & 0xFFFF) as i16 as i32;
+            if client_x < DIVIDER_HIT_ZONE {
+                let mut pt = POINT::default();
+                let _ = GetCursorPos(&mut pt);
+                let mut state = lock_state();
+                if let Some(s) = state.as_mut() {
+                    s.dragging = true;
+                    s.drag_start_mouse_x = pt.x;
+                    s.drag_start_offset = s.tray_offset;
+                }
+                SetCapture(hwnd);
+            }
+            LRESULT(0)
+        }
+        WM_MOUSEMOVE => {
+            let is_dragging = {
+                let state = lock_state();
+                state.as_ref().map(|s| s.dragging).unwrap_or(false)
+            };
+            if is_dragging {
+                let mut pt = POINT::default();
+                let _ = GetCursorPos(&mut pt);
+
+                let mut state = lock_state();
+                let s = match state.as_mut() {
+                    Some(s) => s,
+                    None => return LRESULT(0),
+                };
+
+                // Moving mouse left = positive delta = larger offset (further left)
+                let delta = s.drag_start_mouse_x - pt.x;
+                let mut new_offset = s.drag_start_offset + delta;
+
+                // Clamp: offset >= 0 (can't go right of default)
+                if new_offset < 0 {
+                    new_offset = 0;
+                }
+
+                // Clamp: don't go past left edge of taskbar
+                if let Some(taskbar_hwnd) = s.taskbar_hwnd {
+                    if let Some(taskbar_rect) = native_interop::get_taskbar_rect(taskbar_hwnd) {
+                        let mut tray_left = taskbar_rect.right;
+                        if let Some(tray_hwnd) = native_interop::find_child_window(taskbar_hwnd, "TrayNotifyWnd") {
+                            if let Some(tray_rect) = native_interop::get_window_rect_safe(tray_hwnd) {
+                                tray_left = tray_rect.left;
+                            }
+                        }
+                        let widget_width = total_widget_width();
+                        let max_offset = if s.embedded {
+                            tray_left - taskbar_rect.left - widget_width
+                        } else {
+                            tray_left - taskbar_rect.left - widget_width
+                        };
+                        if new_offset > max_offset {
+                            new_offset = max_offset;
+                        }
+                    }
+                }
+
+                s.tray_offset = new_offset;
+
+                // Move window directly
+                let hwnd_val = s.hwnd.to_hwnd();
+                if let Some(taskbar_hwnd) = s.taskbar_hwnd {
+                    if let Some(taskbar_rect) = native_interop::get_taskbar_rect(taskbar_hwnd) {
+                        let taskbar_height = taskbar_rect.bottom - taskbar_rect.top;
+                        let mut tray_left = taskbar_rect.right;
+                        if let Some(tray_hwnd) = native_interop::find_child_window(taskbar_hwnd, "TrayNotifyWnd") {
+                            if let Some(tray_rect) = native_interop::get_window_rect_safe(tray_hwnd) {
+                                tray_left = tray_rect.left;
+                            }
+                        }
+                        let widget_width = total_widget_width();
+                        if s.embedded {
+                            let x = tray_left - taskbar_rect.left - widget_width - new_offset;
+                            let y = (taskbar_height - WIDGET_HEIGHT) / 2;
+                            native_interop::move_window(hwnd_val, x, y, widget_width, WIDGET_HEIGHT);
+                        } else {
+                            let x = tray_left - widget_width - new_offset;
+                            let y = taskbar_rect.top + (taskbar_height - WIDGET_HEIGHT) / 2;
+                            native_interop::move_window(hwnd_val, x, y, widget_width, WIDGET_HEIGHT);
+                        }
+                    }
+                }
+            }
+            LRESULT(0)
+        }
+        WM_LBUTTONUP => {
+            let was_dragging = {
+                let mut state = lock_state();
+                if let Some(s) = state.as_mut() {
+                    if s.dragging {
+                        s.dragging = false;
+                        let offset = s.tray_offset;
+                        Some(offset)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            };
+            if was_dragging.is_some() {
+                let _ = ReleaseCapture();
+                save_state_settings();
+            }
+            LRESULT(0)
+        }
         WM_RBUTTONUP => {
             show_context_menu(hwnd);
             LRESULT(0)
@@ -908,6 +1115,16 @@ unsafe extern "system" fn wnd_proc(
                     }
                     PostQuitMessage(0);
                 }
+                IDM_RESET_POSITION => {
+                    {
+                        let mut state = lock_state();
+                        if let Some(s) = state.as_mut() {
+                            s.tray_offset = 0;
+                        }
+                    }
+                    save_state_settings();
+                    position_at_taskbar();
+                }
                 IDM_START_WITH_WINDOWS => {
                     set_startup_enabled(!is_startup_enabled());
                 }
@@ -925,6 +1142,7 @@ unsafe extern "system" fn wnd_proc(
                             s.poll_interval_ms = new_interval;
                         }
                     }
+                    save_state_settings();
                     // Reset the poll timer with the new interval
                     SetTimer(hwnd, TIMER_POLL, new_interval, None);
                 }
@@ -1009,6 +1227,14 @@ fn show_context_menu(hwnd: HWND) {
             startup_flags,
             IDM_START_WITH_WINDOWS as usize,
             PCWSTR::from_raw(startup_str.as_ptr()),
+        );
+
+        let reset_pos_str = native_interop::wide_str("Reset Position");
+        let _ = AppendMenuW(
+            settings_menu,
+            MENU_ITEM_FLAGS(0),
+            IDM_RESET_POSITION as usize,
+            PCWSTR::from_raw(reset_pos_str.as_ptr()),
         );
 
         let _ = AppendMenuW(settings_menu, MF_SEPARATOR, 0, PCWSTR::null());
