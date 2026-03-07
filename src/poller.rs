@@ -2,12 +2,14 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use std::os::windows::process::CommandExt;
 use serde::Deserialize;
 
 use crate::models::{UsageData, UsageSection};
 
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 const MODEL_FALLBACK_CHAIN: &[&str] = &[
     "claude-3-haiku-20240307",
@@ -74,6 +76,7 @@ fn cli_refresh_token() {
     };
     cmd.env_remove("CLAUDECODE")
         .env_remove("CLAUDE_CODE_ENTRYPOINT")
+        .creation_flags(CREATE_NO_WINDOW)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
 
