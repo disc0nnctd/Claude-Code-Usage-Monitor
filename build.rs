@@ -16,6 +16,10 @@ fn main() {
     let version = version.trim().trim_start_matches('v');
     println!("cargo:rustc-env=APP_VERSION={version}");
 
+    // Re-run build script whenever HEAD or tags change so the version stays current.
+    println!("cargo:rerun-if-changed=.git/HEAD");
+    println!("cargo:rerun-if-changed=.git/refs/tags");
+
     // Embed the application icon into the executable.
     let mut res = winres::WindowsResource::new();
     res.set_icon("src/icons/icon.ico");

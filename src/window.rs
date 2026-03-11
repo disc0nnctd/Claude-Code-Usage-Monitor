@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -8,6 +9,7 @@ use windows::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW
 use windows::Win32::System::Registry::*;
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::Accessibility::HWINEVENTHOOK;
+use windows::Win32::UI::HiDpi::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::PCWSTR;
@@ -74,6 +76,33 @@ const IDM_START_WITH_WINDOWS: u16 = 20;
 const IDM_RESET_POSITION: u16 = 30;
 
 const DIVIDER_HIT_ZONE: i32 = 13; // LEFT_DIVIDER_W + DIVIDER_RIGHT_MARGIN
+
+const WM_DPICHANGED_MSG: u32 = 0x02E0;
+
+/// Current system DPI (96 = 100% scaling, 144 = 150%, 192 = 200%, etc.)
+static CURRENT_DPI: AtomicU32 = AtomicU32::new(96);
+
+/// Scale a base pixel value (designed at 96 DPI) to the current DPI.
+fn sc(px: i32) -> i32 {
+    let dpi = CURRENT_DPI.load(Ordering::Relaxed);
+    (px as f64 * dpi as f64 / 96.0).round() as i32
+}
+
+/// Re-query the monitor DPI for our window and update the cached value.
+/// Uses GetDpiForWindow which returns the live DPI (unlike GetDpiForSystem
+/// which is cached at process startup and never changes).
+fn refresh_dpi() {
+    let hwnd = {
+        let state = lock_state();
+        state.as_ref().map(|s| s.hwnd.to_hwnd())
+    };
+    if let Some(hwnd) = hwnd {
+        let dpi = unsafe { GetDpiForWindow(hwnd) };
+        if dpi > 0 {
+            CURRENT_DPI.store(dpi, Ordering::Relaxed);
+        }
+    }
+}
 
 unsafe impl Send for AppState {}
 
@@ -269,18 +298,24 @@ const RIGHT_MARGIN: i32 = 1;
 const WIDGET_HEIGHT: i32 = 46;
 
 fn total_widget_width() -> i32 {
-    LEFT_DIVIDER_W
-        + DIVIDER_RIGHT_MARGIN
-        + LABEL_WIDTH
-        + LABEL_RIGHT_MARGIN
-        + (SEGMENT_W + SEGMENT_GAP) * SEGMENT_COUNT
-        - SEGMENT_GAP
-        + BAR_RIGHT_MARGIN
-        + TEXT_WIDTH
-        + RIGHT_MARGIN
+    sc(LEFT_DIVIDER_W)
+        + sc(DIVIDER_RIGHT_MARGIN)
+        + sc(LABEL_WIDTH)
+        + sc(LABEL_RIGHT_MARGIN)
+        + (sc(SEGMENT_W) + sc(SEGMENT_GAP)) * SEGMENT_COUNT
+        - sc(SEGMENT_GAP)
+        + sc(BAR_RIGHT_MARGIN)
+        + sc(TEXT_WIDTH)
+        + sc(RIGHT_MARGIN)
 }
 
 pub fn run() {
+    // Enable Per-Monitor DPI Awareness V2 for crisp rendering at any scale factor
+    unsafe {
+        let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        CURRENT_DPI.store(GetDpiForSystem(), Ordering::Relaxed);
+    }
+
     // Single-instance guard: silently exit if another instance is running
     let mutex_name = native_interop::wide_str("Global\\ClaudeCodeUsageMonitor");
     let _mutex = unsafe {
@@ -324,7 +359,7 @@ pub fn run() {
             0,
             0,
             total_widget_width(),
-            WIDGET_HEIGHT,
+            sc(WIDGET_HEIGHT),
             HWND::default(),
             HMENU::default(),
             hinstance,
@@ -431,6 +466,7 @@ pub fn run() {
 /// Renders fully opaque with the actual taskbar background colour so that
 /// ClearType sub-pixel font rendering can be used for crisp, OS-native text.
 fn render_layered() {
+    refresh_dpi();
     let (hwnd_val, is_dark, embedded, session_pct, session_text, weekly_pct, weekly_text) = {
         let state = lock_state();
         match state.as_ref() {
@@ -458,7 +494,7 @@ fn render_layered() {
     }
 
     let width = total_widget_width();
-    let height = WIDGET_HEIGHT;
+    let height = sc(WIDGET_HEIGHT);
 
     let accent = Color::from_hex("#D97757");
     let track = if is_dark {
@@ -588,8 +624,9 @@ fn paint_content(
         let _ = DeleteObject(bg_brush);
 
         // Left divider
-        let divider_top = (height - 25) / 2;
-        let divider_bottom = divider_top + 25;
+        let divider_h = sc(25);
+        let divider_top = (height - divider_h) / 2;
+        let divider_bottom = divider_top + divider_h;
 
         let (div_left, div_right) = if is_dark {
             ((80, 80, 80), (40, 40, 40))
@@ -601,7 +638,7 @@ fn paint_content(
         let left_rect = RECT {
             left: 0,
             top: divider_top,
-            right: 2,
+            right: sc(2),
             bottom: divider_bottom,
         };
         FillRect(hdc, &left_rect, left_brush);
@@ -609,24 +646,24 @@ fn paint_content(
 
         let right_brush = CreateSolidBrush(COLORREF(native_interop::colorref(div_right.0, div_right.1, div_right.2)));
         let right_rect = RECT {
-            left: 2,
+            left: sc(2),
             top: divider_top,
-            right: 3,
+            right: sc(3),
             bottom: divider_bottom,
         };
         FillRect(hdc, &right_rect, right_brush);
         let _ = DeleteObject(right_brush);
 
-        let content_x = LEFT_DIVIDER_W + DIVIDER_RIGHT_MARGIN;
-        let row1_y = 5;
-        let row2_y = 5 + SEGMENT_H + 10;
+        let content_x = sc(LEFT_DIVIDER_W) + sc(DIVIDER_RIGHT_MARGIN);
+        let row1_y = sc(5);
+        let row2_y = sc(5) + sc(SEGMENT_H) + sc(10);
 
         let _ = SetBkMode(hdc, TRANSPARENT);
         let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
 
         let font_name = native_interop::wide_str("Segoe UI");
         let font = CreateFontW(
-            -12,
+            sc(-12),
             0,
             0,
             0,
@@ -797,6 +834,7 @@ fn update_display() {
 }
 
 fn position_at_taskbar() {
+    refresh_dpi();
     let state = lock_state();
     let s = match state.as_ref() {
         Some(s) => s,
@@ -833,16 +871,17 @@ fn position_at_taskbar() {
 
     let widget_width = total_widget_width();
 
+    let widget_height = sc(WIDGET_HEIGHT);
     if embedded {
         // Child window: coordinates relative to parent (taskbar)
         let x = tray_left - taskbar_rect.left - widget_width - tray_offset;
-        let y = (taskbar_height - WIDGET_HEIGHT) / 2;
-        native_interop::move_window(hwnd, x, y, widget_width, WIDGET_HEIGHT);
+        let y = (taskbar_height - widget_height) / 2;
+        native_interop::move_window(hwnd, x, y, widget_width, widget_height);
     } else {
         // Topmost popup: screen coordinates
         let x = tray_left - widget_width - tray_offset;
-        let y = taskbar_rect.top + (taskbar_height - WIDGET_HEIGHT) / 2;
-        native_interop::move_window(hwnd, x, y, widget_width, WIDGET_HEIGHT);
+        let y = taskbar_rect.top + (taskbar_height - widget_height) / 2;
+        native_interop::move_window(hwnd, x, y, widget_width, widget_height);
     }
 }
 
@@ -883,6 +922,7 @@ unsafe extern "system" fn on_tray_location_changed(
         };
         if should_reposition {
             position_at_taskbar();
+            render_layered();
         }
     }
 }
@@ -915,8 +955,14 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         WM_ERASEBKGND => LRESULT(1),
-        WM_DISPLAYCHANGE => {
+        WM_DISPLAYCHANGE | WM_DPICHANGED_MSG | WM_SETTINGCHANGE => {
+            if msg == WM_DPICHANGED_MSG {
+                let new_dpi = (wparam.0 & 0xFFFF) as u32;
+                CURRENT_DPI.store(new_dpi, Ordering::Relaxed);
+            }
+            refresh_dpi();
             position_at_taskbar();
+            render_layered();
             LRESULT(0)
         }
         WM_TIMER => {
@@ -966,7 +1012,7 @@ unsafe extern "system" fn wnd_proc(
                 let mut pt = POINT::default();
                 let _ = GetCursorPos(&mut pt);
                 let _ = ScreenToClient(hwnd, &mut pt);
-                if pt.x < DIVIDER_HIT_ZONE {
+                if pt.x < sc(DIVIDER_HIT_ZONE) {
                     let cursor = LoadCursorW(HINSTANCE::default(), IDC_SIZEWE)
                         .unwrap_or_default();
                     SetCursor(cursor);
@@ -977,7 +1023,7 @@ unsafe extern "system" fn wnd_proc(
         }
         WM_LBUTTONDOWN => {
             let client_x = (lparam.0 & 0xFFFF) as i16 as i32;
-            if client_x < DIVIDER_HIT_ZONE {
+            if client_x < sc(DIVIDER_HIT_ZONE) {
                 let mut pt = POINT::default();
                 let _ = GetCursorPos(&mut pt);
                 let mut state = lock_state();
@@ -1049,14 +1095,15 @@ unsafe extern "system" fn wnd_proc(
                             }
                         }
                         let widget_width = total_widget_width();
+                        let widget_height = sc(WIDGET_HEIGHT);
                         if s.embedded {
                             let x = tray_left - taskbar_rect.left - widget_width - new_offset;
-                            let y = (taskbar_height - WIDGET_HEIGHT) / 2;
-                            native_interop::move_window(hwnd_val, x, y, widget_width, WIDGET_HEIGHT);
+                            let y = (taskbar_height - widget_height) / 2;
+                            native_interop::move_window(hwnd_val, x, y, widget_width, widget_height);
                         } else {
                             let x = tray_left - widget_width - new_offset;
-                            let y = taskbar_rect.top + (taskbar_height - WIDGET_HEIGHT) / 2;
-                            native_interop::move_window(hwnd_val, x, y, widget_width, WIDGET_HEIGHT);
+                            let y = taskbar_rect.top + (taskbar_height - widget_height) / 2;
+                            native_interop::move_window(hwnd_val, x, y, widget_width, widget_height);
                         }
                     }
                 }
@@ -1342,13 +1389,18 @@ fn draw_row(
     accent: &Color,
     track: &Color,
 ) {
+    let seg_w = sc(SEGMENT_W);
+    let seg_h = sc(SEGMENT_H);
+    let seg_gap = sc(SEGMENT_GAP);
+    let corner_r = sc(CORNER_RADIUS);
+
     unsafe {
         let mut label_wide: Vec<u16> = label.encode_utf16().collect();
         let mut label_rect = RECT {
             left: x,
             top: y,
-            right: x + LABEL_WIDTH,
-            bottom: y + SEGMENT_H,
+            right: x + sc(LABEL_WIDTH),
+            bottom: y + seg_h,
         };
         let _ = DrawTextW(
             hdc,
@@ -1357,43 +1409,43 @@ fn draw_row(
             DT_LEFT | DT_VCENTER | DT_SINGLELINE,
         );
 
-        let bar_x = x + LABEL_WIDTH + LABEL_RIGHT_MARGIN;
+        let bar_x = x + sc(LABEL_WIDTH) + sc(LABEL_RIGHT_MARGIN);
         let percent_clamped = percent.clamp(0.0, 100.0);
 
         for i in 0..SEGMENT_COUNT {
-            let seg_x = bar_x + i * (SEGMENT_W + SEGMENT_GAP);
+            let seg_x = bar_x + i * (seg_w + seg_gap);
             let seg_start = (i as f64) * 10.0;
             let seg_end = seg_start + 10.0;
 
             let seg_rect = RECT {
                 left: seg_x,
                 top: y,
-                right: seg_x + SEGMENT_W,
-                bottom: y + SEGMENT_H,
+                right: seg_x + seg_w,
+                bottom: y + seg_h,
             };
 
             if percent_clamped >= seg_end {
-                draw_rounded_rect(hdc, &seg_rect, accent, CORNER_RADIUS);
+                draw_rounded_rect(hdc, &seg_rect, accent, corner_r);
             } else if percent_clamped <= seg_start {
-                draw_rounded_rect(hdc, &seg_rect, track, CORNER_RADIUS);
+                draw_rounded_rect(hdc, &seg_rect, track, corner_r);
             } else {
-                draw_rounded_rect(hdc, &seg_rect, track, CORNER_RADIUS);
+                draw_rounded_rect(hdc, &seg_rect, track, corner_r);
                 let fraction = (percent_clamped - seg_start) / 10.0;
-                let fill_width = (SEGMENT_W as f64 * fraction) as i32;
+                let fill_width = (seg_w as f64 * fraction) as i32;
                 if fill_width > 0 {
                     let fill_rect = RECT {
                         left: seg_x,
                         top: y,
                         right: seg_x + fill_width,
-                        bottom: y + SEGMENT_H,
+                        bottom: y + seg_h,
                     };
                     let rgn = CreateRoundRectRgn(
                         seg_rect.left,
                         seg_rect.top,
                         seg_rect.right + 1,
                         seg_rect.bottom + 1,
-                        CORNER_RADIUS * 2,
-                        CORNER_RADIUS * 2,
+                        corner_r * 2,
+                        corner_r * 2,
                     );
                     let _ = SelectClipRgn(hdc, rgn);
                     let brush = CreateSolidBrush(COLORREF(accent.to_colorref()));
@@ -1406,13 +1458,13 @@ fn draw_row(
         }
 
         let text_x =
-            bar_x + SEGMENT_COUNT * (SEGMENT_W + SEGMENT_GAP) - SEGMENT_GAP + BAR_RIGHT_MARGIN;
+            bar_x + SEGMENT_COUNT * (seg_w + seg_gap) - seg_gap + sc(BAR_RIGHT_MARGIN);
         let mut text_wide: Vec<u16> = text.encode_utf16().collect();
         let mut text_rect = RECT {
             left: text_x,
             top: y,
-            right: text_x + TEXT_WIDTH,
-            bottom: y + SEGMENT_H,
+            right: text_x + sc(TEXT_WIDTH),
+            bottom: y + seg_h,
         };
         let _ = DrawTextW(
             hdc,
