@@ -22,6 +22,7 @@ use crate::native_interop::{
 };
 use crate::poller;
 use crate::theme;
+use crate::updater::{self, ReleaseDescriptor, UpdateCheckResult};
 
 /// Wrapper to make HWND sendable across threads (safe for PostMessage usage)
 #[derive(Clone, Copy)]
@@ -59,11 +60,21 @@ struct AppState {
     poll_interval_ms: u32,
     retry_count: u32,
     last_poll_ok: bool,
+    update_status: UpdateStatus,
 
     tray_offset: i32,
     dragging: bool,
     drag_start_mouse_x: i32,
     drag_start_offset: i32,
+}
+
+#[derive(Clone, Debug)]
+enum UpdateStatus {
+    Idle,
+    Checking,
+    Applying,
+    UpToDate,
+    Available(ReleaseDescriptor),
 }
 
 const RETRY_BASE_MS: u32 = 30_000; // 30 seconds
@@ -80,6 +91,7 @@ const IDM_FREQ_15MIN: u16 = 12;
 const IDM_FREQ_1HOUR: u16 = 13;
 const IDM_START_WITH_WINDOWS: u16 = 20;
 const IDM_RESET_POSITION: u16 = 30;
+const IDM_VERSION_ACTION: u16 = 31;
 const IDM_LANG_SYSTEM: u16 = 40;
 const IDM_LANG_ENGLISH: u16 = 41;
 const IDM_LANG_SPANISH: u16 = 42;
@@ -90,6 +102,7 @@ const IDM_LANG_JAPANESE: u16 = 45;
 const DIVIDER_HIT_ZONE: i32 = 13; // LEFT_DIVIDER_W + DIVIDER_RIGHT_MARGIN
 
 const WM_DPICHANGED_MSG: u32 = 0x02E0;
+const WM_APP_UPDATE_CHECK_COMPLETE: u32 = WM_APP + 2;
 
 /// Current system DPI (96 = 100% scaling, 144 = 150%, 192 = 200%, etc.)
 static CURRENT_DPI: AtomicU32 = AtomicU32::new(96);
@@ -213,6 +226,32 @@ fn set_window_title(hwnd: HWND, strings: Strings) {
     }
 }
 
+fn show_info_message(hwnd: HWND, title: &str, message: &str) {
+    unsafe {
+        let title_wide = native_interop::wide_str(title);
+        let message_wide = native_interop::wide_str(message);
+        let _ = MessageBoxW(
+            hwnd,
+            PCWSTR::from_raw(message_wide.as_ptr()),
+            PCWSTR::from_raw(title_wide.as_ptr()),
+            MB_OK | MB_ICONINFORMATION,
+        );
+    }
+}
+
+fn show_error_message(hwnd: HWND, title: &str, message: &str) {
+    unsafe {
+        let title_wide = native_interop::wide_str(title);
+        let message_wide = native_interop::wide_str(message);
+        let _ = MessageBoxW(
+            hwnd,
+            PCWSTR::from_raw(message_wide.as_ptr()),
+            PCWSTR::from_raw(title_wide.as_ptr()),
+            MB_OK | MB_ICONERROR,
+        );
+    }
+}
+
 fn apply_language_to_state(state: &mut AppState, language_override: Option<LanguageId>) {
     state.language_override = language_override;
     state.language = localization::resolve_language(language_override);
@@ -237,6 +276,136 @@ fn update_language_change() -> bool {
 
     apply_language_to_state(app_state, None);
     true
+}
+
+fn version_action_label(strings: Strings, status: &UpdateStatus) -> String {
+    let current = env!("CARGO_PKG_VERSION");
+    match status {
+        UpdateStatus::Idle => format!("v{current} - {}", strings.check_for_updates),
+        UpdateStatus::Checking => format!("v{current} - {}", strings.checking_for_updates),
+        UpdateStatus::Applying => format!("v{current} - {}", strings.applying_update),
+        UpdateStatus::UpToDate => format!("v{current} - {}", strings.up_to_date_short),
+        UpdateStatus::Available(release) => {
+            format!(
+                "v{current} - {} v{}",
+                strings.update_to, release.latest_version
+            )
+        }
+    }
+}
+
+fn begin_update_check(hwnd: HWND) {
+    let send_hwnd = SendHwnd::from_hwnd(hwnd);
+    let strings = {
+        let mut state = lock_state();
+        let Some(app_state) = state.as_mut() else {
+            return;
+        };
+
+        if matches!(
+            app_state.update_status,
+            UpdateStatus::Checking | UpdateStatus::Applying
+        ) {
+            show_info_message(
+                hwnd,
+                app_state.language.strings().updates,
+                app_state.language.strings().update_in_progress,
+            );
+            return;
+        }
+
+        app_state.update_status = UpdateStatus::Applying;
+        app_state.language.strings()
+    };
+
+    std::thread::spawn(move || {
+        let hwnd = send_hwnd.to_hwnd();
+        match updater::check_for_updates() {
+            Ok(UpdateCheckResult::UpToDate) => {
+                {
+                    let mut state = lock_state();
+                    if let Some(s) = state.as_mut() {
+                        s.update_status = UpdateStatus::UpToDate;
+                    }
+                }
+                show_info_message(hwnd, strings.updates, strings.up_to_date);
+                unsafe {
+                    let _ = PostMessageW(hwnd, WM_APP_UPDATE_CHECK_COMPLETE, WPARAM(0), LPARAM(0));
+                }
+            }
+            Ok(UpdateCheckResult::Available(release)) => {
+                {
+                    let mut state = lock_state();
+                    if let Some(s) = state.as_mut() {
+                        s.update_status = UpdateStatus::Available(release);
+                    }
+                }
+                unsafe {
+                    let _ = PostMessageW(hwnd, WM_APP_UPDATE_CHECK_COMPLETE, WPARAM(0), LPARAM(0));
+                }
+            }
+            Err(error) => {
+                {
+                    let mut state = lock_state();
+                    if let Some(s) = state.as_mut() {
+                        s.update_status = UpdateStatus::Idle;
+                    }
+                }
+                let message = format!("{}.\n\n{}", strings.update_failed, error);
+                show_error_message(hwnd, strings.updates, &message);
+                unsafe {
+                    let _ = PostMessageW(hwnd, WM_APP_UPDATE_CHECK_COMPLETE, WPARAM(0), LPARAM(0));
+                }
+            }
+        }
+    });
+}
+
+fn begin_update_apply(hwnd: HWND, release: ReleaseDescriptor) {
+    let send_hwnd = SendHwnd::from_hwnd(hwnd);
+    let strings = {
+        let mut state = lock_state();
+        let Some(app_state) = state.as_mut() else {
+            return;
+        };
+
+        if matches!(
+            app_state.update_status,
+            UpdateStatus::Checking | UpdateStatus::Applying
+        ) {
+            show_info_message(
+                hwnd,
+                app_state.language.strings().updates,
+                app_state.language.strings().update_in_progress,
+            );
+            return;
+        }
+
+        app_state.update_status = UpdateStatus::Checking;
+        app_state.language.strings()
+    };
+
+    std::thread::spawn(move || {
+        let hwnd = send_hwnd.to_hwnd();
+        match updater::begin_self_update(&release) {
+            Ok(()) => unsafe {
+                let _ = PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
+            },
+            Err(error) => {
+                {
+                    let mut state = lock_state();
+                    if let Some(s) = state.as_mut() {
+                        s.update_status = UpdateStatus::Available(release);
+                    }
+                }
+                let message = format!("{}.\n\n{}", strings.update_failed, error);
+                show_error_message(hwnd, strings.updates, &message);
+                unsafe {
+                    let _ = PostMessageW(hwnd, WM_APP_UPDATE_CHECK_COMPLETE, WPARAM(0), LPARAM(0));
+                }
+            }
+        }
+    });
 }
 
 const STARTUP_REGISTRY_PATH: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
@@ -465,6 +634,7 @@ pub fn run() {
                 poll_interval_ms: settings.poll_interval_ms,
                 retry_count: 0,
                 last_poll_ok: false,
+                update_status: UpdateStatus::Idle,
                 tray_offset: settings.tray_offset,
                 dragging: false,
                 drag_start_mouse_x: 0,
@@ -1115,6 +1285,7 @@ unsafe extern "system" fn wnd_proc(
             schedule_countdown_timer();
             LRESULT(0)
         }
+        WM_APP_UPDATE_CHECK_COMPLETE => LRESULT(0),
         WM_SETCURSOR => {
             let is_dragging = {
                 let state = lock_state();
@@ -1289,6 +1460,21 @@ unsafe extern "system" fn wnd_proc(
                         do_poll(sh);
                     });
                 }
+                IDM_VERSION_ACTION => {
+                    let release = {
+                        let state = lock_state();
+                        match state.as_ref().map(|s| &s.update_status) {
+                            Some(UpdateStatus::Available(release)) => Some(release.clone()),
+                            _ => None,
+                        }
+                    };
+
+                    if let Some(release) = release {
+                        begin_update_apply(hwnd, release);
+                    } else {
+                        begin_update_check(hwnd);
+                    }
+                }
                 2 => {
                     let hook = {
                         let state = lock_state();
@@ -1371,15 +1557,21 @@ unsafe extern "system" fn wnd_proc(
 
 fn show_context_menu(hwnd: HWND) {
     unsafe {
-        let (current_interval, strings, language_override) = {
+        let (current_interval, strings, language_override, update_status) = {
             let state = lock_state();
             match state.as_ref() {
                 Some(s) => (
                     s.poll_interval_ms,
                     s.language.strings(),
                     s.language_override,
+                    s.update_status.clone(),
                 ),
-                None => (POLL_15_MIN, LanguageId::English.strings(), None),
+                None => (
+                    POLL_15_MIN,
+                    LanguageId::English.strings(),
+                    None,
+                    UpdateStatus::Idle,
+                ),
             }
         };
 
@@ -1494,11 +1686,20 @@ fn show_context_menu(hwnd: HWND) {
 
         let _ = AppendMenuW(settings_menu, MF_SEPARATOR, 0, PCWSTR::null());
 
-        let version_str = native_interop::wide_str(&format!("v{}", env!("CARGO_PKG_VERSION")));
+        let version_label = version_action_label(strings, &update_status);
+        let version_str = native_interop::wide_str(&version_label);
+        let version_flags = if matches!(
+            update_status,
+            UpdateStatus::Checking | UpdateStatus::Applying
+        ) {
+            MF_GRAYED
+        } else {
+            MENU_ITEM_FLAGS(0)
+        };
         let _ = AppendMenuW(
             settings_menu,
-            MF_GRAYED,
-            0,
+            version_flags,
+            IDM_VERSION_ACTION as usize,
             PCWSTR::from_raw(version_str.as_ptr()),
         );
 
