@@ -18,9 +18,7 @@ fn main() {
 
 fn pack_version(version: &str) -> u64 {
     let core = version.split('-').next().unwrap_or(version);
-    let mut parts = core
-        .split('.')
-        .map(|part| part.parse::<u64>().unwrap_or(0));
+    let mut parts = core.split('.').map(|part| part.parse::<u64>().unwrap_or(0));
 
     let major = parts.next().unwrap_or(0).min(u16::MAX as u64);
     let minor = parts.next().unwrap_or(0).min(u16::MAX as u64);

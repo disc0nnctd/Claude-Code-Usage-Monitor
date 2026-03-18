@@ -1,5 +1,6 @@
 #![windows_subsystem = "windows"]
 
+mod localization;
 mod models;
 mod native_interop;
 mod poller;

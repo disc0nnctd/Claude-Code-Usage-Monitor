@@ -3,6 +3,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
+use windows::core::PCWSTR;
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW};
@@ -12,10 +14,12 @@ use windows::Win32::UI::Accessibility::HWINEVENTHOOK;
 use windows::Win32::UI::HiDpi::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows::Win32::UI::WindowsAndMessaging::*;
-use windows::core::PCWSTR;
 
+use crate::localization::{self, LanguageId, Strings};
 use crate::models::UsageData;
-use crate::native_interop::{self, Color, TIMER_COUNTDOWN, TIMER_POLL, TIMER_RESET_POLL, WM_APP_USAGE_UPDATED};
+use crate::native_interop::{
+    self, Color, TIMER_COUNTDOWN, TIMER_POLL, TIMER_RESET_POLL, WM_APP_USAGE_UPDATED,
+};
 use crate::poller;
 use crate::theme;
 
@@ -42,6 +46,8 @@ struct AppState {
     win_event_hook: Option<HWINEVENTHOOK>,
     is_dark: bool,
     embedded: bool,
+    language_override: Option<LanguageId>,
+    language: LanguageId,
 
     session_percent: f64,
     session_text: String,
@@ -74,6 +80,12 @@ const IDM_FREQ_15MIN: u16 = 12;
 const IDM_FREQ_1HOUR: u16 = 13;
 const IDM_START_WITH_WINDOWS: u16 = 20;
 const IDM_RESET_POSITION: u16 = 30;
+const IDM_LANG_SYSTEM: u16 = 40;
+const IDM_LANG_ENGLISH: u16 = 41;
+const IDM_LANG_SPANISH: u16 = 42;
+const IDM_LANG_FRENCH: u16 = 43;
+const IDM_LANG_GERMAN: u16 = 44;
+const IDM_LANG_JAPANESE: u16 = 45;
 
 const DIVIDER_HIT_ZONE: i32 = 13; // LEFT_DIVIDER_W + DIVIDER_RIGHT_MARGIN
 
@@ -113,7 +125,6 @@ fn lock_state() -> MutexGuard<'static, Option<AppState>> {
     STATE.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-
 fn settings_path() -> PathBuf {
     let appdata = std::env::var("APPDATA").unwrap_or_else(|_| ".".to_string());
     PathBuf::from(appdata)
@@ -121,48 +132,111 @@ fn settings_path() -> PathBuf {
         .join("settings.json")
 }
 
-fn parse_json_i32(content: &str, key: &str) -> Option<i32> {
-    let needle = format!("\"{}\"", key);
-    let pos = content.find(&needle)?;
-    let rest = &content[pos + needle.len()..];
-    let colon = rest.find(':')?;
-    let num_str: String = rest[colon + 1..]
-        .trim()
-        .chars()
-        .take_while(|c| c.is_ascii_digit() || *c == '-')
-        .collect();
-    num_str.parse().ok()
+#[derive(Debug, Serialize, Deserialize)]
+struct SettingsFile {
+    #[serde(default)]
+    tray_offset: i32,
+    #[serde(default = "default_poll_interval")]
+    poll_interval_ms: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    language: Option<String>,
 }
 
-fn load_settings() -> (i32, u32) {
+impl Default for SettingsFile {
+    fn default() -> Self {
+        Self {
+            tray_offset: 0,
+            poll_interval_ms: default_poll_interval(),
+            language: None,
+        }
+    }
+}
+
+fn default_poll_interval() -> u32 {
+    POLL_15_MIN
+}
+
+fn load_settings() -> SettingsFile {
     let content = match std::fs::read_to_string(settings_path()) {
         Ok(c) => c,
-        Err(_) => return (0, POLL_15_MIN),
+        Err(_) => return SettingsFile::default(),
     };
-    let tray_offset = parse_json_i32(&content, "tray_offset").unwrap_or(0);
-    let poll_interval = parse_json_i32(&content, "poll_interval_ms")
-        .map(|v| v as u32)
-        .unwrap_or(POLL_15_MIN);
-    (tray_offset, poll_interval)
+    serde_json::from_str(&content).unwrap_or_default()
 }
 
-fn save_settings(tray_offset: i32, poll_interval_ms: u32) {
+fn save_settings(settings: &SettingsFile) {
     let path = settings_path();
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let json = format!(
-        "{{\n  \"tray_offset\": {},\n  \"poll_interval_ms\": {}\n}}",
-        tray_offset, poll_interval_ms
-    );
-    let _ = std::fs::write(path, json);
+    if let Ok(json) = serde_json::to_string_pretty(settings) {
+        let _ = std::fs::write(path, json);
+    }
 }
 
 fn save_state_settings() {
     let state = lock_state();
     if let Some(s) = state.as_ref() {
-        save_settings(s.tray_offset, s.poll_interval_ms);
+        save_settings(&SettingsFile {
+            tray_offset: s.tray_offset,
+            poll_interval_ms: s.poll_interval_ms,
+            language: s
+                .language_override
+                .map(|language| language.code().to_string()),
+        });
     }
+}
+
+fn refresh_usage_texts(state: &mut AppState) {
+    if !state.last_poll_ok {
+        return;
+    }
+
+    let strings = state.language.strings();
+    let Some((session_text, weekly_text)) = state.data.as_ref().map(|data| {
+        (
+            poller::format_line(&data.session, strings),
+            poller::format_line(&data.weekly, strings),
+        )
+    }) else {
+        return;
+    };
+
+    state.session_text = session_text;
+    state.weekly_text = weekly_text;
+}
+
+fn set_window_title(hwnd: HWND, strings: Strings) {
+    unsafe {
+        let title = native_interop::wide_str(strings.window_title);
+        let _ = SetWindowTextW(hwnd, PCWSTR::from_raw(title.as_ptr()));
+    }
+}
+
+fn apply_language_to_state(state: &mut AppState, language_override: Option<LanguageId>) {
+    state.language_override = language_override;
+    state.language = localization::resolve_language(language_override);
+    set_window_title(state.hwnd.to_hwnd(), state.language.strings());
+    refresh_usage_texts(state);
+}
+
+fn update_language_change() -> bool {
+    let mut state = lock_state();
+    let Some(app_state) = state.as_mut() else {
+        return false;
+    };
+
+    if app_state.language_override.is_some() {
+        return false;
+    }
+
+    let new_language = localization::detect_system_language();
+    if new_language == app_state.language {
+        return false;
+    }
+
+    apply_language_to_state(app_state, None);
+    true
 }
 
 const STARTUP_REGISTRY_PATH: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
@@ -217,10 +291,8 @@ fn is_startup_enabled() -> bool {
         }
 
         // Convert the registry value (UTF-16) to a string
-        let wide_slice = std::slice::from_raw_parts(
-            buf.as_ptr() as *const u16,
-            data_size as usize / 2,
-        );
+        let wide_slice =
+            std::slice::from_raw_parts(buf.as_ptr() as *const u16, data_size as usize / 2);
         let reg_value = String::from_utf16_lossy(wide_slice)
             .trim_end_matches('\0')
             .to_string();
@@ -349,8 +421,12 @@ pub fn run() {
 
         RegisterClassExW(&wc);
 
+        let settings = load_settings();
+        let language_override = settings.language.as_deref().and_then(LanguageId::from_code);
+        let language = localization::resolve_language(language_override);
+
         // Create as layered popup (will be reparented into taskbar)
-        let title = native_interop::wide_str("Claude Code Usage Monitor");
+        let title = native_interop::wide_str(language.strings().window_title);
         let hwnd = CreateWindowExW(
             WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_NOACTIVATE,
             PCWSTR::from_raw(class_name.as_ptr()),
@@ -369,7 +445,6 @@ pub fn run() {
 
         let is_dark = theme::is_dark_mode();
         let mut embedded = false;
-        let (saved_offset, saved_poll_interval) = load_settings();
 
         {
             let mut state = lock_state();
@@ -380,15 +455,17 @@ pub fn run() {
                 win_event_hook: None,
                 is_dark,
                 embedded: false,
+                language_override,
+                language,
                 session_percent: 0.0,
                 session_text: "--".to_string(),
                 weekly_percent: 0.0,
                 weekly_text: "--".to_string(),
                 data: None,
-                poll_interval_ms: saved_poll_interval,
+                poll_interval_ms: settings.poll_interval_ms,
                 retry_count: 0,
                 last_poll_ok: false,
-                tray_offset: saved_offset,
+                tray_offset: settings.tray_offset,
                 dragging: false,
                 drag_start_mouse_x: 0,
                 drag_start_offset: 0,
@@ -410,8 +487,7 @@ pub fn run() {
 
             if let Some(tray_hwnd) = tray_notify {
                 let thread_id = native_interop::get_window_thread_id(tray_hwnd);
-                let hook =
-                    native_interop::set_tray_event_hook(thread_id, on_tray_location_changed);
+                let hook = native_interop::set_tray_event_hook(thread_id, on_tray_location_changed);
                 s.win_event_hook = hook;
             }
         }
@@ -440,7 +516,10 @@ pub fn run() {
         // Poll timer: 15 minutes
         let initial_poll_ms = {
             let state = lock_state();
-            state.as_ref().map(|s| s.poll_interval_ms).unwrap_or(POLL_15_MIN)
+            state
+                .as_ref()
+                .map(|s| s.poll_interval_ms)
+                .unwrap_or(POLL_15_MIN)
         };
         SetTimer(hwnd, TIMER_POLL, initial_poll_ms, None);
 
@@ -467,13 +546,14 @@ pub fn run() {
 /// ClearType sub-pixel font rendering can be used for crisp, OS-native text.
 fn render_layered() {
     refresh_dpi();
-    let (hwnd_val, is_dark, embedded, session_pct, session_text, weekly_pct, weekly_text) = {
+    let (hwnd_val, is_dark, embedded, strings, session_pct, session_text, weekly_pct, weekly_text) = {
         let state = lock_state();
         match state.as_ref() {
             Some(s) => (
                 s.hwnd,
                 s.is_dark,
                 s.embedded,
+                s.language.strings(),
                 s.session_percent,
                 s.session_text.clone(),
                 s.weekly_percent,
@@ -531,8 +611,8 @@ fn render_layered() {
 
         let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
         let mem_dc = CreateCompatibleDC(screen_dc);
-        let dib = CreateDIBSection(mem_dc, &bmi, DIB_RGB_COLORS, &mut bits, None, 0)
-            .unwrap_or_default();
+        let dib =
+            CreateDIBSection(mem_dc, &bmi, DIB_RGB_COLORS, &mut bits, None, 0).unwrap_or_default();
 
         if dib.is_invalid() || bits.is_null() {
             let _ = DeleteDC(mem_dc);
@@ -546,9 +626,21 @@ fn render_layered() {
         // Render once with the actual taskbar background colour.
         // Using an opaque background lets us use CLEARTYPE_QUALITY for
         // sub-pixel font rendering that matches the rest of the OS.
-        paint_content(mem_dc, width, height, is_dark, &bg_color,
-                      &text_color, &accent, &track,
-                      session_pct, &session_text, weekly_pct, &weekly_text);
+        paint_content(
+            mem_dc,
+            width,
+            height,
+            is_dark,
+            &bg_color,
+            &text_color,
+            &accent,
+            &track,
+            strings,
+            session_pct,
+            &session_text,
+            weekly_pct,
+            &weekly_text,
+        );
 
         // Background pixels → alpha 1 (nearly invisible but still hittable for right-click).
         // Content pixels → fully opaque (preserves ClearType sub-pixel rendering).
@@ -606,6 +698,7 @@ fn paint_content(
     text_color: &Color,
     accent: &Color,
     track: &Color,
+    strings: Strings,
     session_pct: f64,
     session_text: &str,
     weekly_pct: f64,
@@ -634,7 +727,9 @@ fn paint_content(
             ((160, 160, 160), (230, 230, 230))
         };
 
-        let left_brush = CreateSolidBrush(COLORREF(native_interop::colorref(div_left.0, div_left.1, div_left.2)));
+        let left_brush = CreateSolidBrush(COLORREF(native_interop::colorref(
+            div_left.0, div_left.1, div_left.2,
+        )));
         let left_rect = RECT {
             left: 0,
             top: divider_top,
@@ -644,7 +739,11 @@ fn paint_content(
         FillRect(hdc, &left_rect, left_brush);
         let _ = DeleteObject(left_brush);
 
-        let right_brush = CreateSolidBrush(COLORREF(native_interop::colorref(div_right.0, div_right.1, div_right.2)));
+        let right_brush = CreateSolidBrush(COLORREF(native_interop::colorref(
+            div_right.0,
+            div_right.1,
+            div_right.2,
+        )));
         let right_rect = RECT {
             left: sc(2),
             top: divider_top,
@@ -680,8 +779,26 @@ fn paint_content(
         );
         let old_font = SelectObject(hdc, font);
 
-        draw_row(hdc, content_x, row1_y, "5h", session_pct, session_text, accent, track);
-        draw_row(hdc, content_x, row2_y, "7d", weekly_pct, weekly_text, accent, track);
+        draw_row(
+            hdc,
+            content_x,
+            row1_y,
+            strings.session_window,
+            session_pct,
+            session_text,
+            accent,
+            track,
+        );
+        draw_row(
+            hdc,
+            content_x,
+            row2_y,
+            strings.weekly_window,
+            weekly_pct,
+            weekly_text,
+            accent,
+            track,
+        );
 
         SelectObject(hdc, old_font);
         let _ = DeleteObject(font);
@@ -692,15 +809,10 @@ fn do_poll(send_hwnd: SendHwnd) {
     let hwnd = send_hwnd.to_hwnd();
     match poller::poll() {
         Ok(data) => {
-            let session_text = poller::format_line(&data.session);
-            let weekly_text = poller::format_line(&data.weekly);
-
             let mut state = lock_state();
             if let Some(s) = state.as_mut() {
                 s.session_percent = data.session.percentage;
                 s.weekly_percent = data.weekly.percentage;
-                s.session_text = session_text;
-                s.weekly_text = weekly_text;
                 // Stop fast-poll if reset data is now fresh
                 if !poller::is_past_reset(&data) {
                     unsafe {
@@ -710,6 +822,7 @@ fn do_poll(send_hwnd: SendHwnd) {
 
                 s.data = Some(data);
                 s.last_poll_ok = true;
+                refresh_usage_texts(s);
 
                 // Recovered from errors — restore normal poll interval
                 if s.retry_count > 0 {
@@ -735,9 +848,8 @@ fn do_poll(send_hwnd: SendHwnd) {
 
                 // Exponential backoff retry: 30s, 60s, 120s, ... up to poll_interval
                 s.retry_count = s.retry_count.saturating_add(1);
-                let backoff = RETRY_BASE_MS.saturating_mul(
-                    1u32.checked_shl(s.retry_count - 1).unwrap_or(u32::MAX),
-                );
+                let backoff = RETRY_BASE_MS
+                    .saturating_mul(1u32.checked_shl(s.retry_count - 1).unwrap_or(u32::MAX));
                 let retry_ms = backoff.min(s.poll_interval_ms);
 
                 unsafe {
@@ -815,6 +927,12 @@ fn check_theme_change() {
     }
 }
 
+fn check_language_change() {
+    if update_language_change() {
+        render_layered();
+    }
+}
+
 fn update_display() {
     let mut state = lock_state();
     let s = match state.as_mut() {
@@ -827,10 +945,7 @@ fn update_display() {
         return;
     }
 
-    if let Some(ref data) = s.data {
-        s.session_text = poller::format_line(&data.session);
-        s.weekly_text = poller::format_line(&data.weekly);
-    }
+    refresh_usage_texts(s);
 }
 
 fn position_at_taskbar() {
@@ -960,6 +1075,10 @@ unsafe extern "system" fn wnd_proc(
                 let new_dpi = (wparam.0 & 0xFFFF) as u32;
                 CURRENT_DPI.store(new_dpi, Ordering::Relaxed);
             }
+            if msg == WM_SETTINGCHANGE {
+                check_theme_change();
+                check_language_change();
+            }
             refresh_dpi();
             position_at_taskbar();
             render_layered();
@@ -991,6 +1110,7 @@ unsafe extern "system" fn wnd_proc(
         }
         WM_APP_USAGE_UPDATED => {
             check_theme_change();
+            check_language_change();
             render_layered();
             schedule_countdown_timer();
             LRESULT(0)
@@ -1003,18 +1123,17 @@ unsafe extern "system" fn wnd_proc(
             // Always show resize cursor while dragging or when hovering divider zone
             let hit_test = (lparam.0 & 0xFFFF) as u16;
             if is_dragging {
-                let cursor = LoadCursorW(HINSTANCE::default(), IDC_SIZEWE)
-                    .unwrap_or_default();
+                let cursor = LoadCursorW(HINSTANCE::default(), IDC_SIZEWE).unwrap_or_default();
                 SetCursor(cursor);
                 return LRESULT(1);
             }
-            if hit_test == 1 { // HTCLIENT
+            if hit_test == 1 {
+                // HTCLIENT
                 let mut pt = POINT::default();
                 let _ = GetCursorPos(&mut pt);
                 let _ = ScreenToClient(hwnd, &mut pt);
                 if pt.x < sc(DIVIDER_HIT_ZONE) {
-                    let cursor = LoadCursorW(HINSTANCE::default(), IDC_SIZEWE)
-                        .unwrap_or_default();
+                    let cursor = LoadCursorW(HINSTANCE::default(), IDC_SIZEWE).unwrap_or_default();
                     SetCursor(cursor);
                     return LRESULT(1);
                 }
@@ -1064,8 +1183,11 @@ unsafe extern "system" fn wnd_proc(
                 if let Some(taskbar_hwnd) = s.taskbar_hwnd {
                     if let Some(taskbar_rect) = native_interop::get_taskbar_rect(taskbar_hwnd) {
                         let mut tray_left = taskbar_rect.right;
-                        if let Some(tray_hwnd) = native_interop::find_child_window(taskbar_hwnd, "TrayNotifyWnd") {
-                            if let Some(tray_rect) = native_interop::get_window_rect_safe(tray_hwnd) {
+                        if let Some(tray_hwnd) =
+                            native_interop::find_child_window(taskbar_hwnd, "TrayNotifyWnd")
+                        {
+                            if let Some(tray_rect) = native_interop::get_window_rect_safe(tray_hwnd)
+                            {
                                 tray_left = tray_rect.left;
                             }
                         }
@@ -1089,8 +1211,11 @@ unsafe extern "system" fn wnd_proc(
                     if let Some(taskbar_rect) = native_interop::get_taskbar_rect(taskbar_hwnd) {
                         let taskbar_height = taskbar_rect.bottom - taskbar_rect.top;
                         let mut tray_left = taskbar_rect.right;
-                        if let Some(tray_hwnd) = native_interop::find_child_window(taskbar_hwnd, "TrayNotifyWnd") {
-                            if let Some(tray_rect) = native_interop::get_window_rect_safe(tray_hwnd) {
+                        if let Some(tray_hwnd) =
+                            native_interop::find_child_window(taskbar_hwnd, "TrayNotifyWnd")
+                        {
+                            if let Some(tray_rect) = native_interop::get_window_rect_safe(tray_hwnd)
+                            {
                                 tray_left = tray_rect.left;
                             }
                         }
@@ -1099,11 +1224,23 @@ unsafe extern "system" fn wnd_proc(
                         if s.embedded {
                             let x = tray_left - taskbar_rect.left - widget_width - new_offset;
                             let y = (taskbar_height - widget_height) / 2;
-                            native_interop::move_window(hwnd_val, x, y, widget_width, widget_height);
+                            native_interop::move_window(
+                                hwnd_val,
+                                x,
+                                y,
+                                widget_width,
+                                widget_height,
+                            );
                         } else {
                             let x = tray_left - widget_width - new_offset;
                             let y = taskbar_rect.top + (taskbar_height - widget_height) / 2;
-                            native_interop::move_window(hwnd_val, x, y, widget_width, widget_height);
+                            native_interop::move_window(
+                                hwnd_val,
+                                x,
+                                y,
+                                widget_width,
+                                widget_height,
+                            );
                         }
                     }
                 }
@@ -1193,6 +1330,26 @@ unsafe extern "system" fn wnd_proc(
                     // Reset the poll timer with the new interval
                     SetTimer(hwnd, TIMER_POLL, new_interval, None);
                 }
+                IDM_LANG_SYSTEM | IDM_LANG_ENGLISH | IDM_LANG_SPANISH | IDM_LANG_FRENCH
+                | IDM_LANG_GERMAN | IDM_LANG_JAPANESE => {
+                    let language_override = match id {
+                        IDM_LANG_SYSTEM => None,
+                        IDM_LANG_ENGLISH => Some(LanguageId::English),
+                        IDM_LANG_SPANISH => Some(LanguageId::Spanish),
+                        IDM_LANG_FRENCH => Some(LanguageId::French),
+                        IDM_LANG_GERMAN => Some(LanguageId::German),
+                        IDM_LANG_JAPANESE => Some(LanguageId::Japanese),
+                        _ => None,
+                    };
+                    {
+                        let mut state = lock_state();
+                        if let Some(s) = state.as_mut() {
+                            apply_language_to_state(s, language_override);
+                        }
+                    }
+                    save_state_settings();
+                    render_layered();
+                }
                 _ => {}
             }
             LRESULT(0)
@@ -1214,14 +1371,21 @@ unsafe extern "system" fn wnd_proc(
 
 fn show_context_menu(hwnd: HWND) {
     unsafe {
-        let current_interval = {
+        let (current_interval, strings, language_override) = {
             let state = lock_state();
-            state.as_ref().map(|s| s.poll_interval_ms).unwrap_or(POLL_15_MIN)
+            match state.as_ref() {
+                Some(s) => (
+                    s.poll_interval_ms,
+                    s.language.strings(),
+                    s.language_override,
+                ),
+                None => (POLL_15_MIN, LanguageId::English.strings(), None),
+            }
         };
 
         let menu = CreatePopupMenu().unwrap();
 
-        let refresh_str = native_interop::wide_str("Refresh");
+        let refresh_str = native_interop::wide_str(strings.refresh);
         let _ = AppendMenuW(
             menu,
             MENU_ITEM_FLAGS(0),
@@ -1231,13 +1395,13 @@ fn show_context_menu(hwnd: HWND) {
 
         // Update Frequency submenu
         let freq_menu = CreatePopupMenu().unwrap();
-        let freq_items: &[(u16, u32, &str)] = &[
-            (IDM_FREQ_1MIN, POLL_1_MIN, "1 Minute"),
-            (IDM_FREQ_5MIN, POLL_5_MIN, "5 Minutes"),
-            (IDM_FREQ_15MIN, POLL_15_MIN, "15 Minutes"),
-            (IDM_FREQ_1HOUR, POLL_1_HOUR, "1 Hour"),
+        let freq_items: [(u16, u32, &str); 4] = [
+            (IDM_FREQ_1MIN, POLL_1_MIN, strings.one_minute),
+            (IDM_FREQ_5MIN, POLL_5_MIN, strings.five_minutes),
+            (IDM_FREQ_15MIN, POLL_15_MIN, strings.fifteen_minutes),
+            (IDM_FREQ_1HOUR, POLL_1_HOUR, strings.one_hour),
         ];
-        for &(id, interval, label) in freq_items {
+        for (id, interval, label) in freq_items {
             let label_str = native_interop::wide_str(label);
             let flags = if interval == current_interval {
                 MF_CHECKED
@@ -1252,7 +1416,7 @@ fn show_context_menu(hwnd: HWND) {
             );
         }
 
-        let freq_label = native_interop::wide_str("Update Frequency");
+        let freq_label = native_interop::wide_str(strings.update_frequency);
         let _ = AppendMenuW(
             menu,
             MF_POPUP,
@@ -1263,7 +1427,7 @@ fn show_context_menu(hwnd: HWND) {
         // Settings submenu
         let settings_menu = CreatePopupMenu().unwrap();
 
-        let startup_str = native_interop::wide_str("Start with Windows");
+        let startup_str = native_interop::wide_str(strings.start_with_windows);
         let startup_flags = if is_startup_enabled() {
             MF_CHECKED
         } else {
@@ -1276,12 +1440,56 @@ fn show_context_menu(hwnd: HWND) {
             PCWSTR::from_raw(startup_str.as_ptr()),
         );
 
-        let reset_pos_str = native_interop::wide_str("Reset Position");
+        let reset_pos_str = native_interop::wide_str(strings.reset_position);
         let _ = AppendMenuW(
             settings_menu,
             MENU_ITEM_FLAGS(0),
             IDM_RESET_POSITION as usize,
             PCWSTR::from_raw(reset_pos_str.as_ptr()),
+        );
+
+        let language_menu = CreatePopupMenu().unwrap();
+        let system_label = native_interop::wide_str(strings.system_default);
+        let system_flags = if language_override.is_none() {
+            MF_CHECKED
+        } else {
+            MENU_ITEM_FLAGS(0)
+        };
+        let _ = AppendMenuW(
+            language_menu,
+            system_flags,
+            IDM_LANG_SYSTEM as usize,
+            PCWSTR::from_raw(system_label.as_ptr()),
+        );
+
+        for language in LanguageId::ALL {
+            let id = match language {
+                LanguageId::English => IDM_LANG_ENGLISH,
+                LanguageId::Spanish => IDM_LANG_SPANISH,
+                LanguageId::French => IDM_LANG_FRENCH,
+                LanguageId::German => IDM_LANG_GERMAN,
+                LanguageId::Japanese => IDM_LANG_JAPANESE,
+            };
+            let label_str = native_interop::wide_str(language.native_name());
+            let flags = if language_override == Some(language) {
+                MF_CHECKED
+            } else {
+                MENU_ITEM_FLAGS(0)
+            };
+            let _ = AppendMenuW(
+                language_menu,
+                flags,
+                id as usize,
+                PCWSTR::from_raw(label_str.as_ptr()),
+            );
+        }
+
+        let language_label = native_interop::wide_str(strings.language);
+        let _ = AppendMenuW(
+            settings_menu,
+            MF_POPUP,
+            language_menu.0 as usize,
+            PCWSTR::from_raw(language_label.as_ptr()),
         );
 
         let _ = AppendMenuW(settings_menu, MF_SEPARATOR, 0, PCWSTR::null());
@@ -1294,7 +1502,7 @@ fn show_context_menu(hwnd: HWND) {
             PCWSTR::from_raw(version_str.as_ptr()),
         );
 
-        let settings_label = native_interop::wide_str("Settings");
+        let settings_label = native_interop::wide_str(strings.settings);
         let _ = AppendMenuW(
             menu,
             MF_POPUP,
@@ -1304,7 +1512,7 @@ fn show_context_menu(hwnd: HWND) {
 
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
 
-        let exit_str = native_interop::wide_str("Exit");
+        let exit_str = native_interop::wide_str(strings.exit);
         let _ = AppendMenuW(
             menu,
             MENU_ITEM_FLAGS(0),
@@ -1322,11 +1530,12 @@ fn show_context_menu(hwnd: HWND) {
 
 /// Paint for non-embedded fallback (normal WM_PAINT path)
 fn paint(hdc: HDC, hwnd: HWND) {
-    let (is_dark, session_pct, session_text, weekly_pct, weekly_text) = {
+    let (is_dark, strings, session_pct, session_text, weekly_pct, weekly_text) = {
         let state = lock_state();
         match state.as_ref() {
             Some(s) => (
                 s.is_dark,
+                s.language.strings(),
                 s.session_percent,
                 s.session_text.clone(),
                 s.weekly_percent,
@@ -1367,9 +1576,21 @@ fn paint(hdc: HDC, hwnd: HWND) {
         let mem_bmp = CreateCompatibleBitmap(hdc, width, height);
         let old_bmp = SelectObject(mem_dc, mem_bmp);
 
-        paint_content(mem_dc, width, height, is_dark, &bg_color,
-                      &text_color, &accent, &track,
-                      session_pct, &session_text, weekly_pct, &weekly_text);
+        paint_content(
+            mem_dc,
+            width,
+            height,
+            is_dark,
+            &bg_color,
+            &text_color,
+            &accent,
+            &track,
+            strings,
+            session_pct,
+            &session_text,
+            weekly_pct,
+            &weekly_text,
+        );
 
         let _ = BitBlt(hdc, 0, 0, width, height, mem_dc, 0, 0, SRCCOPY);
 
@@ -1457,8 +1678,7 @@ fn draw_row(
             }
         }
 
-        let text_x =
-            bar_x + SEGMENT_COUNT * (seg_w + seg_gap) - seg_gap + sc(BAR_RIGHT_MARGIN);
+        let text_x = bar_x + SEGMENT_COUNT * (seg_w + seg_gap) - seg_gap + sc(BAR_RIGHT_MARGIN);
         let mut text_wide: Vec<u16> = text.encode_utf16().collect();
         let mut text_rect = RECT {
             left: text_x,

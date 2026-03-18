@@ -1,7 +1,7 @@
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
-use windows::Win32::UI::Shell::{ABM_GETTASKBARPOS, APPBARDATA, SHAppBarMessage};
+use windows::Win32::UI::Shell::{SHAppBarMessage, ABM_GETTASKBARPOS, APPBARDATA};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 // Window style constants
@@ -107,15 +107,7 @@ pub fn move_window(hwnd: HWND, x: i32, y: i32, w: i32, h: i32) {
 /// Set up a WinEvent hook for tray location changes
 pub fn set_tray_event_hook(
     thread_id: u32,
-    callback: unsafe extern "system" fn(
-        HWINEVENTHOOK,
-        u32,
-        HWND,
-        i32,
-        i32,
-        u32,
-        u32,
-    ),
+    callback: unsafe extern "system" fn(HWINEVENTHOOK, u32, HWND, i32, i32, u32, u32),
 ) -> Option<HWINEVENTHOOK> {
     unsafe {
         let hook = SetWinEventHook(

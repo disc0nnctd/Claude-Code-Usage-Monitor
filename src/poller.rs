@@ -2,19 +2,17 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use std::os::windows::process::CommandExt;
 use serde::Deserialize;
+use std::os::windows::process::CommandExt;
 
+use crate::localization::Strings;
 use crate::models::{UsageData, UsageSection};
 
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
-const MODEL_FALLBACK_CHAIN: &[&str] = &[
-    "claude-3-haiku-20240307",
-    "claude-haiku-4-5-20251001",
-];
+const MODEL_FALLBACK_CHAIN: &[&str] = &["claude-3-haiku-20240307", "claude-haiku-4-5-20251001"];
 
 #[derive(Debug)]
 pub enum PollError {
@@ -167,7 +165,11 @@ fn resolve_windows_claude_path() -> String {
     }
 
     for name in &["claude.cmd", "claude"] {
-        if let Ok(output) = Command::new("where.exe").arg(name).creation_flags(CREATE_NO_WINDOW).output() {
+        if let Ok(output) = Command::new("where.exe")
+            .arg(name)
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+        {
             if output.status.success() {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 if let Some(first_line) = stdout.lines().next() {
@@ -280,11 +282,19 @@ fn fetch_usage_via_messages(token: &str) -> Result<UsageData, PollError> {
 fn parse_rate_limit_headers(response: &ureq::Response) -> UsageData {
     let mut data = UsageData::default();
 
-    data.session.percentage = get_header_f64(response, "anthropic-ratelimit-unified-5h-utilization") * 100.0;
-    data.session.resets_at = unix_to_system_time(get_header_i64(response, "anthropic-ratelimit-unified-5h-reset"));
+    data.session.percentage =
+        get_header_f64(response, "anthropic-ratelimit-unified-5h-utilization") * 100.0;
+    data.session.resets_at = unix_to_system_time(get_header_i64(
+        response,
+        "anthropic-ratelimit-unified-5h-reset",
+    ));
 
-    data.weekly.percentage = get_header_f64(response, "anthropic-ratelimit-unified-7d-utilization") * 100.0;
-    data.weekly.resets_at = unix_to_system_time(get_header_i64(response, "anthropic-ratelimit-unified-7d-reset"));
+    data.weekly.percentage =
+        get_header_f64(response, "anthropic-ratelimit-unified-7d-utilization") * 100.0;
+    data.weekly.resets_at = unix_to_system_time(get_header_i64(
+        response,
+        "anthropic-ratelimit-unified-7d-reset",
+    ));
 
     let overall_reset = get_header_i64(response, "anthropic-ratelimit-unified-reset");
 
@@ -315,9 +325,7 @@ fn get_header_f64(response: &ureq::Response, name: &str) -> f64 {
 }
 
 fn get_header_i64(response: &ureq::Response, name: &str) -> Option<i64> {
-    response
-        .header(name)
-        .and_then(|s| s.parse::<i64>().ok())
+    response.header(name).and_then(|s| s.parse::<i64>().ok())
 }
 
 fn unix_to_system_time(unix_secs: Option<i64>) -> Option<SystemTime> {
@@ -404,7 +412,10 @@ fn parse_credentials(content: &str, source: CredentialSource) -> Option<Credenti
     let json: serde_json::Value = serde_json::from_str(content).ok()?;
 
     let oauth = json.get("claudeAiOauth")?;
-    let access_token = oauth.get("accessToken").and_then(|v| v.as_str())?.to_string();
+    let access_token = oauth
+        .get("accessToken")
+        .and_then(|v| v.as_str())?
+        .to_string();
     let expires_at = oauth.get("expiresAt").and_then(|v| v.as_i64());
 
     Some(Credentials {
@@ -524,7 +535,9 @@ fn parse_datetime_to_unix(s: &str, _fmt: &str) -> Result<u64, ()> {
     // Extract date and time parts from "YYYY-MM-DDTHH:MM:SS[.frac]"
     let (date_str, time_str) = s.split_once('T').ok_or(())?;
     let date_parts: Vec<&str> = date_str.split('-').collect();
-    if date_parts.len() != 3 { return Err(()); }
+    if date_parts.len() != 3 {
+        return Err(());
+    }
 
     let year: u64 = date_parts[0].parse().map_err(|_| ())?;
     let month: u64 = date_parts[1].parse().map_err(|_| ())?;
@@ -533,7 +546,9 @@ fn parse_datetime_to_unix(s: &str, _fmt: &str) -> Result<u64, ()> {
     // Strip fractional seconds
     let time_base = time_str.split('.').next().unwrap_or(time_str);
     let time_parts: Vec<&str> = time_base.split(':').collect();
-    if time_parts.len() != 3 { return Err(()); }
+    if time_parts.len() != 3 {
+        return Err(());
+    }
 
     let hour: u64 = time_parts[0].parse().map_err(|_| ())?;
     let min: u64 = time_parts[1].parse().map_err(|_| ())?;
@@ -562,9 +577,9 @@ fn is_leap(y: u64) -> bool {
 }
 
 /// Format a usage section as "X% · Yh" style text
-pub fn format_line(section: &UsageSection) -> String {
+pub fn format_line(section: &UsageSection, strings: Strings) -> String {
     let pct = format!("{:.0}%", section.percentage);
-    let cd = format_countdown(section.resets_at);
+    let cd = format_countdown(section.resets_at, strings);
     if cd.is_empty() {
         pct
     } else {
@@ -572,7 +587,7 @@ pub fn format_line(section: &UsageSection) -> String {
     }
 }
 
-fn format_countdown(resets_at: Option<SystemTime>) -> String {
+fn format_countdown(resets_at: Option<SystemTime>, strings: Strings) -> String {
     let reset = match resets_at {
         Some(t) => t,
         None => return String::new(),
@@ -580,7 +595,7 @@ fn format_countdown(resets_at: Option<SystemTime>) -> String {
 
     let remaining = match reset.duration_since(SystemTime::now()) {
         Ok(d) => d,
-        Err(_) => return "now".to_string(),
+        Err(_) => return strings.now.to_string(),
     };
 
     let total_secs = remaining.as_secs();
@@ -589,13 +604,13 @@ fn format_countdown(resets_at: Option<SystemTime>) -> String {
     let total_days = total_secs / 86400;
 
     if total_days >= 1 {
-        format!("{total_days}d")
+        format!("{total_days}{}", strings.day_suffix)
     } else if total_mins > 61 {
-        format!("{total_hours}h")
+        format!("{total_hours}{}", strings.hour_suffix)
     } else if total_secs > 60 {
-        format!("{total_mins}m")
+        format!("{total_mins}{}", strings.minute_suffix)
     } else {
-        format!("{total_secs}")
+        format!("{total_secs}{}", strings.second_suffix)
     }
 }
 
