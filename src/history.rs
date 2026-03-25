@@ -16,6 +16,8 @@ use crate::models::{
 use crate::pricing;
 
 pub const DEFAULT_ARCHIVE_REPO_URL: &str = "git@github.com:disc0nnctd/personal-token-usage.git";
+pub const DEFAULT_WORKFLOW_FILE_NAME: &str = "build-history-report.yml";
+const SAMPLE_WORKFLOW_YAML: &str = include_str!("../docs/build-history-report.sample.yml");
 
 const HISTORY_CACHE_TTL: Duration = Duration::from_secs(60);
 const HISTORY_STORE_VERSION: u32 = 1;
@@ -185,6 +187,11 @@ pub struct ArchiveResult {
 pub struct FetchResult {
     pub repo_url: String,
     pub message: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct WorkflowInstallResult {
+    pub location: String,
 }
 
 static HISTORY_CACHE: OnceLock<Mutex<Option<CachedSnapshot>>> = OnceLock::new();
@@ -1149,6 +1156,68 @@ pub fn fetch_history_from_github(
     Ok(FetchResult { repo_url, message })
 }
 
+pub fn install_sample_workflow_to_github(
+    sync: &HistorySyncSettings,
+    token: &str,
+) -> Result<WorkflowInstallResult, String> {
+    let token = token.trim();
+    if token.is_empty() {
+        return Err("A GitHub token is required to install the workflow.".to_string());
+    }
+
+    let repo_url = effective_archive_repo_url(sync.repo_url.as_deref());
+    let repo = parse_github_repo_spec(&repo_url)?;
+    let workflow_file = workflow_file_name(sync.workflow_file.as_deref())?;
+    let remote_path = format!(".github/workflows/{workflow_file}");
+    upload_github_file(
+        &repo,
+        token,
+        sync.branch.as_deref(),
+        &remote_path,
+        SAMPLE_WORKFLOW_YAML.as_bytes(),
+        &format!("Install workflow {workflow_file}"),
+    )?;
+
+    Ok(WorkflowInstallResult {
+        location: format!(
+            "{repo_url} [{}] -> {}",
+            effective_archive_branch(sync.branch.as_deref()).unwrap_or_else(|| "default branch".to_string()),
+            remote_path
+        ),
+    })
+}
+
+pub fn install_sample_workflow_to_local_repo(
+    local_repo_path: &Path,
+    workflow_file: Option<&str>,
+) -> Result<PathBuf, String> {
+    let repo_root = validate_local_repo_root(local_repo_path)?;
+    let workflow_name = workflow_file_name(workflow_file)?;
+    let workflows_dir = repo_root.join(".github").join("workflows");
+    std::fs::create_dir_all(&workflows_dir).map_err(|error| {
+        format!(
+            "Unable to create local workflows directory {}: {error}",
+            workflows_dir.display()
+        )
+    })?;
+
+    let workflow_path = workflows_dir.join(workflow_name);
+    std::fs::write(&workflow_path, SAMPLE_WORKFLOW_YAML).map_err(|error| {
+        format!(
+            "Unable to write local workflow file {}: {error}",
+            workflow_path.display()
+        )
+    })?;
+
+    Ok(workflow_path)
+}
+
+pub fn local_workflows_dir(local_repo_path: &Path) -> Result<PathBuf, String> {
+    Ok(validate_local_repo_root(local_repo_path)?
+        .join(".github")
+        .join("workflows"))
+}
+
 fn refresh_store_best_effort(sync: &HistorySyncSettings) -> HistoryStore {
     refresh_store(sync).unwrap_or_else(|_| {
         if sync.storage_mode == HistoryStorageMode::Local {
@@ -1189,6 +1258,28 @@ fn collect_live_store() -> HistoryStore {
     let _ = merge_sessions(&mut store, scan_claude_sessions());
     let _ = merge_sessions(&mut store, scan_codex_sessions());
     store
+}
+
+fn validate_local_repo_root(path: &Path) -> Result<PathBuf, String> {
+    if !path.exists() {
+        return Err(format!(
+            "Local repository path does not exist: {}",
+            path.display()
+        ));
+    }
+    if !path.is_dir() {
+        return Err(format!(
+            "Local repository path is not a directory: {}",
+            path.display()
+        ));
+    }
+    if !path.join(".git").exists() {
+        return Err(format!(
+            "Local repository path does not look like a git repo: {}",
+            path.display()
+        ));
+    }
+    Ok(path.to_path_buf())
 }
 
 fn load_store() -> Result<HistoryStore, String> {
@@ -1618,6 +1709,27 @@ fn effective_archive_branch(branch: Option<&str>) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
+}
+
+fn workflow_file_name(value: Option<&str>) -> Result<String, String> {
+    let raw = value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(DEFAULT_WORKFLOW_FILE_NAME)
+        .replace('\\', "/");
+    let trimmed = raw
+        .trim_start_matches(".github/workflows/")
+        .trim_start_matches('/');
+    if trimmed.is_empty() {
+        return Err("Workflow file name cannot be empty.".to_string());
+    }
+    if trimmed.contains('/') {
+        return Err("Workflow file must be a file name, not a nested path.".to_string());
+    }
+    if !(trimmed.ends_with(".yml") || trimmed.ends_with(".yaml")) {
+        return Err("Workflow file must end with .yml or .yaml.".to_string());
+    }
+    Ok(trimmed.to_string())
 }
 
 #[derive(Clone, Debug)]

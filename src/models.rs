@@ -35,6 +35,8 @@ pub struct HistorySyncSettings {
     pub repo_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_repo_path: Option<String>,
     #[serde(default = "default_true")]
     pub upload_history_store: bool,
     #[serde(default = "default_true")]
@@ -54,6 +56,7 @@ impl Default for HistorySyncSettings {
         Self {
             repo_url: None,
             branch: None,
+            local_repo_path: None,
             upload_history_store: true,
             upload_html_reports: true,
             upload_conversations: false,

@@ -134,6 +134,9 @@ const IDM_ARCHIVE_HISTORY_GITHUB: u16 = 47;
 const IDM_SET_ARCHIVE_REPO: u16 = 48;
 const IDM_FETCH_HISTORY_GITHUB: u16 = 49;
 const IDM_SETUP_HISTORY_SYNC: u16 = 50;
+const IDM_INSTALL_WORKFLOW_GITHUB: u16 = 51;
+const IDM_INSTALL_WORKFLOW_LOCAL: u16 = 52;
+const IDM_OPEN_LOCAL_WORKFLOWS: u16 = 53;
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 const DIVIDER_HIT_ZONE: i32 = 13; // LEFT_DIVIDER_W + DIVIDER_RIGHT_MARGIN
@@ -731,12 +734,56 @@ fn archive_branch_line(sync: &HistorySyncSettings) -> String {
     }
 }
 
+fn local_repo_line(sync: &HistorySyncSettings) -> String {
+    match sync
+        .local_repo_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(path) => format!("Local repo: {}", trim_for_menu(path, 56)),
+        None => "Local repo: not set".to_string(),
+    }
+}
+
 fn archive_token_from_env() -> Option<String> {
     ["CCUM_GITHUB_TOKEN", "GITHUB_TOKEN"]
         .into_iter()
         .find_map(|name| std::env::var(name).ok())
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+fn effective_local_repo_path(sync: &HistorySyncSettings) -> Option<String> {
+    sync.local_repo_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn prompt_local_repo_path(current: Option<&str>) -> Option<String> {
+    let default_path = current.unwrap_or("");
+    prompt_for_text(
+        "Local Workflow Repo",
+        "Local git repository path where the sample workflow should be installed or opened. No administrator access is required; the folder just needs to be writable.",
+        default_path,
+    )
+    .map(|value| value.trim().to_string())
+    .filter(|value| !value.is_empty())
+}
+
+fn open_in_explorer(path: &std::path::Path) -> Result<(), String> {
+    Command::new("explorer.exe")
+        .arg(path)
+        .spawn()
+        .map_err(|error| format!("Unable to open {} in Explorer: {error}", path.display()))?;
+    Ok(())
+}
+
+fn resolve_local_repo_path(current_sync: &HistorySyncSettings) -> Option<String> {
+    effective_local_repo_path(current_sync)
+        .or_else(|| prompt_local_repo_path(current_sync.local_repo_path.as_deref()))
 }
 
 fn run_sync_setup(hwnd: HWND, current: &HistorySyncSettings) -> Option<HistorySyncSettings> {
@@ -767,6 +814,7 @@ fn run_sync_setup(hwnd: HWND, current: &HistorySyncSettings) -> Option<HistorySy
         let trimmed = branch_value.trim();
         (!trimmed.is_empty()).then(|| trimmed.to_string())
     };
+    let local_repo_path = prompt_local_repo_path(current.local_repo_path.as_deref());
 
     let use_remote_only = ask_yes_no(
         hwnd,
@@ -808,7 +856,10 @@ fn run_sync_setup(hwnd: HWND, current: &HistorySyncSettings) -> Option<HistorySy
         prompt_for_text(
             "Workflow File",
             "Workflow file name to dispatch, for example build-history-report.yml. Leave blank to skip remote workflow dispatch.",
-            current.workflow_file.as_deref().unwrap_or(""),
+            current
+                .workflow_file
+                .as_deref()
+                .unwrap_or(history::DEFAULT_WORKFLOW_FILE_NAME),
         )
     } else {
         Some(String::new())
@@ -817,6 +868,7 @@ fn run_sync_setup(hwnd: HWND, current: &HistorySyncSettings) -> Option<HistorySy
     Some(HistorySyncSettings {
         repo_url,
         branch,
+        local_repo_path,
         upload_history_store,
         upload_html_reports,
         upload_conversations: false,
@@ -2444,6 +2496,105 @@ unsafe extern "system" fn wnd_proc(
                         save_state_settings();
                     }
                 }
+                IDM_INSTALL_WORKFLOW_GITHUB => {
+                    let history_sync = {
+                        let state = lock_state();
+                        state.as_ref().map(|s| s.history_sync.clone())
+                    }
+                    .unwrap_or_default();
+                    let token = archive_token_from_env().or_else(|| {
+                        prompt_for_text(
+                            "GitHub Token",
+                            "Personal access token for workflow installation. It is used only for this upload and is not stored. Modifying .github/workflows requires workflow-related GitHub token permissions.",
+                            "",
+                        )
+                    });
+
+                    if let Some(token) = token {
+                        let send_hwnd = SendHwnd::from_hwnd(hwnd);
+                        std::thread::spawn(move || {
+                            match history::install_sample_workflow_to_github(&history_sync, &token) {
+                                Ok(result) => show_info_message(
+                                    send_hwnd.to_hwnd(),
+                                    "History",
+                                    &format!(
+                                        "Installed sample workflow to {}",
+                                        result.location
+                                    ),
+                                ),
+                                Err(error) => {
+                                    show_error_message(send_hwnd.to_hwnd(), "History", &error)
+                                }
+                            }
+                        });
+                    }
+                }
+                IDM_INSTALL_WORKFLOW_LOCAL => {
+                    let current_sync = {
+                        let state = lock_state();
+                        state.as_ref().map(|s| s.history_sync.clone())
+                    }
+                    .unwrap_or_default();
+                    if let Some(local_repo_path) = resolve_local_repo_path(&current_sync) {
+                        match history::install_sample_workflow_to_local_repo(
+                            std::path::Path::new(&local_repo_path),
+                            current_sync.workflow_file.as_deref(),
+                        ) {
+                            Ok(workflow_path) => {
+                                {
+                                    let mut state = lock_state();
+                                    if let Some(s) = state.as_mut() {
+                                        s.history_sync.local_repo_path = Some(local_repo_path);
+                                    }
+                                }
+                                save_state_settings();
+                                show_info_message(
+                                    hwnd,
+                                    "History",
+                                    &format!(
+                                        "Installed sample workflow locally at {}",
+                                        workflow_path.display()
+                                    ),
+                                );
+                            }
+                            Err(error) => show_error_message(hwnd, "History", &error),
+                        }
+                    }
+                }
+                IDM_OPEN_LOCAL_WORKFLOWS => {
+                    let current_sync = {
+                        let state = lock_state();
+                        state.as_ref().map(|s| s.history_sync.clone())
+                    }
+                    .unwrap_or_default();
+                    if let Some(local_repo_path) = resolve_local_repo_path(&current_sync) {
+                        match history::local_workflows_dir(std::path::Path::new(&local_repo_path)) {
+                            Ok(workflows_dir) => {
+                                if let Err(error) = std::fs::create_dir_all(&workflows_dir) {
+                                    show_error_message(
+                                        hwnd,
+                                        "History",
+                                        &format!(
+                                            "Unable to create local workflows directory {}: {error}",
+                                            workflows_dir.display()
+                                        ),
+                                    );
+                                } else if let Err(error) = open_in_explorer(&workflows_dir) {
+                                    show_error_message(hwnd, "History", &error);
+                                } else {
+                                    {
+                                        let mut state = lock_state();
+                                        if let Some(s) = state.as_mut() {
+                                            s.history_sync.local_repo_path = Some(local_repo_path);
+                                        }
+                                    }
+                                    save_state_settings();
+                                }
+                            }
+                            Err(error) => show_error_message(hwnd, "History", &error),
+                        }
+                    }
+                }
                 IDM_SETUP_HISTORY_SYNC => {
                     let current_sync = {
                         let state = lock_state();
@@ -2662,6 +2813,7 @@ fn show_context_menu(hwnd: HWND) {
         let sync_menu = CreatePopupMenu().unwrap();
         append_disabled_menu_line(sync_menu, &archive_repo_line(&history_sync));
         append_disabled_menu_line(sync_menu, &archive_branch_line(&history_sync));
+        append_disabled_menu_line(sync_menu, &local_repo_line(&history_sync));
         append_disabled_menu_line(sync_menu, &sync_mode_line(&history_sync));
         append_disabled_menu_line(sync_menu, &sync_scopes_line(&history_sync));
         append_disabled_menu_line(sync_menu, &sync_report_source_line(&history_sync));
@@ -2694,6 +2846,28 @@ fn show_context_menu(hwnd: HWND) {
             MENU_ITEM_FLAGS(0),
             IDM_FETCH_HISTORY_GITHUB as usize,
             PCWSTR::from_raw(fetch_history_str.as_ptr()),
+        );
+        let _ = AppendMenuW(sync_menu, MF_SEPARATOR, 0, PCWSTR::null());
+        let install_workflow_github_str = native_interop::wide_str("Install Workflow To GitHub");
+        let _ = AppendMenuW(
+            sync_menu,
+            MENU_ITEM_FLAGS(0),
+            IDM_INSTALL_WORKFLOW_GITHUB as usize,
+            PCWSTR::from_raw(install_workflow_github_str.as_ptr()),
+        );
+        let install_workflow_local_str = native_interop::wide_str("Install Workflow Locally");
+        let _ = AppendMenuW(
+            sync_menu,
+            MENU_ITEM_FLAGS(0),
+            IDM_INSTALL_WORKFLOW_LOCAL as usize,
+            PCWSTR::from_raw(install_workflow_local_str.as_ptr()),
+        );
+        let open_local_workflows_str = native_interop::wide_str("Open Local Workflows Folder");
+        let _ = AppendMenuW(
+            sync_menu,
+            MENU_ITEM_FLAGS(0),
+            IDM_OPEN_LOCAL_WORKFLOWS as usize,
+            PCWSTR::from_raw(open_local_workflows_str.as_ptr()),
         );
 
         let sync_label = native_interop::wide_str("GitHub Sync");
