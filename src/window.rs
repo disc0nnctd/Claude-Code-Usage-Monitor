@@ -353,6 +353,22 @@ fn provider_summary_line(provider: ProviderKind, provider_state: &ProviderState)
     )
 }
 
+fn provider_raw_usage_line(provider: ProviderKind, data: &UsageData) -> String {
+    let s_used = data.session.percentage.clamp(0.0, 100.0);
+    let s_remaining = (100.0 - s_used).max(0.0);
+    let w_used = data.weekly.percentage.clamp(0.0, 100.0);
+    let w_remaining = (100.0 - w_used).max(0.0);
+
+    format!(
+        "{} raw: 5h used {:.0}% rem {:.0}% | 7d used {:.0}% rem {:.0}%",
+        provider_name(provider),
+        s_used,
+        s_remaining,
+        w_used,
+        w_remaining
+    )
+}
+
 fn credits_text(data: &UsageData) -> Option<String> {
     if data.unlimited_credits {
         return Some("Credits: unlimited".to_string());
@@ -825,7 +841,22 @@ fn total_widget_width() -> i32 {
 fn provider_accent(provider: ProviderKind) -> Color {
     match provider {
         ProviderKind::Claude => Color::from_hex("#D97757"),
-        ProviderKind::Codex => Color::from_hex("#2F9E74"),
+        ProviderKind::Codex => Color::from_hex("#10A37F"),
+    }
+}
+
+fn provider_badge_palette(provider: ProviderKind) -> (Color, Color, Color) {
+    match provider {
+        ProviderKind::Claude => (
+            Color::from_hex("#D97757"), // fill
+            Color::from_hex("#8E4A36"), // border
+            Color::from_hex("#FFFFFF"), // text
+        ),
+        ProviderKind::Codex => (
+            Color::from_hex("#10A37F"), // fill
+            Color::from_hex("#0A6A52"), // border
+            Color::from_hex("#FFFFFF"), // text
+        ),
     }
 }
 
@@ -2046,6 +2077,12 @@ fn show_context_menu(hwnd: HWND) {
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         append_disabled_menu_line(menu, &provider_summary_line(ProviderKind::Claude, &claude_state));
         append_disabled_menu_line(menu, &provider_summary_line(ProviderKind::Codex, &codex_state));
+        if let Some(data) = claude_state.data.as_ref() {
+            append_disabled_menu_line(menu, &provider_raw_usage_line(ProviderKind::Claude, data));
+        }
+        if let Some(data) = codex_state.data.as_ref() {
+            append_disabled_menu_line(menu, &provider_raw_usage_line(ProviderKind::Codex, data));
+        }
 
         if let Some(data) = codex_state.data.as_ref() {
             if let Some(plan) = data.plan_name.as_deref().filter(|value| !value.is_empty()) {
@@ -2407,12 +2444,22 @@ fn draw_row(
 }
 
 fn draw_provider_badge(hdc: HDC, rect: &RECT, provider: ProviderKind, accent: &Color) {
-    draw_rounded_rect(hdc, rect, accent, sc(4));
+    let _ = accent;
+    let (fill, border, text) = provider_badge_palette(provider);
+    draw_rounded_rect(hdc, rect, &border, sc(4));
+
+    let inner = RECT {
+        left: rect.left + sc(1),
+        top: rect.top + sc(1),
+        right: rect.right - sc(1),
+        bottom: rect.bottom - sc(1),
+    };
+    draw_rounded_rect(hdc, &inner, &fill, sc(3));
 
     unsafe {
         let font_name = native_interop::wide_str("Segoe UI");
         let font = CreateFontW(
-            sc(-10),
+            sc(-12),
             0,
             0,
             0,
@@ -2428,10 +2475,11 @@ fn draw_provider_badge(hdc: HDC, rect: &RECT, provider: ProviderKind, accent: &C
             PCWSTR::from_raw(font_name.as_ptr()),
         );
         let old_font = SelectObject(hdc, font);
-        let _ = SetTextColor(hdc, COLORREF(native_interop::colorref(255, 255, 255)));
+        let old_bk_mode = SetBkMode(hdc, TRANSPARENT);
+        let _ = SetTextColor(hdc, COLORREF(text.to_colorref()));
 
         let mut text: Vec<u16> = provider.short_label().encode_utf16().collect();
-        let mut text_rect = *rect;
+        let mut text_rect = inner;
         let _ = DrawTextW(
             hdc,
             &mut text,
@@ -2440,6 +2488,7 @@ fn draw_provider_badge(hdc: HDC, rect: &RECT, provider: ProviderKind, accent: &C
         );
 
         SelectObject(hdc, old_font);
+        let _ = SetBkMode(hdc, BACKGROUND_MODE(old_bk_mode as u32));
         let _ = DeleteObject(font);
     }
 }

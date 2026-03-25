@@ -15,8 +15,8 @@ impl ProviderKind {
 
     pub fn short_label(self) -> &'static str {
         match self {
-            Self::Claude => "CLD",
-            Self::Codex => "CDX",
+            Self::Claude => "C",
+            Self::Codex => "O",
         }
     }
 }
