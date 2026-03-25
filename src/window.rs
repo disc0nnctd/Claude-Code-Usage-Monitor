@@ -21,8 +21,7 @@ use crate::diagnose;
 use crate::history;
 use crate::localization::{self, LanguageId, Strings};
 use crate::models::{
-    ActivitySummary, HistoryStorageMode, HistorySummary, HistorySyncSettings, ProjectUsageEntry,
-    ProviderKind, UsageData,
+    ActivitySummary, HistoryStorageMode, HistorySyncSettings, ProviderKind, UsageData,
 };
 use crate::native_interop::{
     self, Color, TIMER_COUNTDOWN, TIMER_POLL, TIMER_RESET_POLL, WM_APP_USAGE_UPDATED,
@@ -137,6 +136,11 @@ const IDM_SETUP_HISTORY_SYNC: u16 = 50;
 const IDM_INSTALL_WORKFLOW_GITHUB: u16 = 51;
 const IDM_INSTALL_WORKFLOW_LOCAL: u16 = 52;
 const IDM_OPEN_LOCAL_WORKFLOWS: u16 = 53;
+const IDM_OPEN_APP_DATA_FOLDER: u16 = 54;
+const IDM_OPEN_LOCAL_HISTORY_FOLDER: u16 = 55;
+const IDM_OPEN_REPORTS_FOLDER: u16 = 56;
+const IDM_OPEN_CLAUDE_SOURCE_FOLDER: u16 = 57;
+const IDM_OPEN_CODEX_SOURCE_FOLDER: u16 = 58;
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 const DIVIDER_HIT_ZONE: i32 = 13; // LEFT_DIVIDER_W + DIVIDER_RIGHT_MARGIN
@@ -432,102 +436,6 @@ fn activity_lines(activity: &ActivitySummary) -> Vec<String> {
     lines
 }
 
-fn history_summary_line(provider: ProviderKind, summary: &HistorySummary) -> String {
-    if summary.total_sessions == 0 {
-        return format!("{} history: no local history", provider_name(provider));
-    }
-
-    let mut parts = vec![
-        format!("{} history:", provider_name(provider)),
-        format!("{} sessions", summary.total_sessions),
-        format!("{} in", format_token_count(summary.input_tokens)),
-        format!("{} out", format_token_count(summary.output_tokens)),
-        format!("~{}", format_usd(summary.estimated_cost_usd)),
-    ];
-
-    if summary.cached_input_tokens > 0 {
-        parts.push(format!("{} cache", format_token_count(summary.cached_input_tokens)));
-    }
-
-    if summary.reasoning_output_tokens > 0 {
-        parts.push(format!(
-            "{} reasoning",
-            format_token_count(summary.reasoning_output_tokens)
-        ));
-    }
-
-    if summary.unpriced_sessions > 0 {
-        parts.push(format!("{} unpriced", summary.unpriced_sessions));
-    }
-
-    parts.join(" | ")
-}
-
-fn history_project_lines(summary: &HistorySummary) -> Vec<String> {
-    summary
-        .top_projects
-        .iter()
-        .take(3)
-        .enumerate()
-        .map(|(index, entry)| {
-            format!(
-                "{}. {} | {} | {} in | {} out{}",
-                index + 1,
-                trim_for_menu(&history_project_label(entry), 26),
-                format_usd(entry.estimated_cost_usd),
-                format_token_count(entry.input_tokens),
-                format_token_count(entry.output_tokens),
-                if entry.cached_input_tokens > 0 {
-                    format!(" | {} cache", format_token_count(entry.cached_input_tokens))
-                } else {
-                    String::new()
-                }
-            )
-        })
-        .collect()
-}
-
-fn history_project_label(entry: &ProjectUsageEntry) -> String {
-    let path = std::path::Path::new(&entry.project_path);
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .filter(|name| !name.is_empty())
-        .unwrap_or(&entry.project_path)
-        .to_string()
-}
-
-fn format_token_count(value: u64) -> String {
-    if value >= 1_000_000_000 {
-        format!("{:.1}B", value as f64 / 1_000_000_000.0)
-    } else if value >= 1_000_000 {
-        format!("{:.1}M", value as f64 / 1_000_000.0)
-    } else if value >= 1_000 {
-        format!("{:.1}K", value as f64 / 1_000.0)
-    } else {
-        value.to_string()
-    }
-}
-
-fn format_usd(value: f64) -> String {
-    if value >= 1000.0 {
-        format!("${:.0}", value)
-    } else if value >= 100.0 {
-        format!("${:.1}", value)
-    } else {
-        format!("${:.2}", value)
-    }
-}
-
-fn append_history_section(menu: HMENU, provider: ProviderKind, summary: &HistorySummary) {
-    append_disabled_menu_line(menu, &history_summary_line(provider, summary));
-    if summary.total_projects > 0 {
-        append_disabled_menu_line(menu, &format!("Projects: {}", summary.total_projects));
-        for line in history_project_lines(summary) {
-            append_disabled_menu_line(menu, &line);
-        }
-    }
-}
-
 fn trim_for_menu(value: &str, max_chars: usize) -> String {
     let normalized = value
         .split_whitespace()
@@ -779,6 +687,42 @@ fn open_in_explorer(path: &std::path::Path) -> Result<(), String> {
         .spawn()
         .map_err(|error| format!("Unable to open {} in Explorer: {error}", path.display()))?;
     Ok(())
+}
+
+fn app_data_folder_path() -> PathBuf {
+    settings_path()
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn local_history_folder_path() -> PathBuf {
+    app_data_folder_path().join("history")
+}
+
+fn reports_folder_path() -> PathBuf {
+    app_data_folder_path().join("reports")
+}
+
+fn claude_source_folder_path() -> Option<PathBuf> {
+    dirs::home_dir().map(|home| home.join(".claude").join("projects"))
+}
+
+fn codex_source_folder_path() -> Option<PathBuf> {
+    dirs::home_dir().map(|home| home.join(".codex").join("sessions"))
+}
+
+fn open_or_create_folder(path: &std::path::Path) -> Result<(), String> {
+    std::fs::create_dir_all(path)
+        .map_err(|error| format!("Unable to create {}: {error}", path.display()))?;
+    open_in_explorer(path)
+}
+
+fn open_existing_folder(path: &std::path::Path) -> Result<(), String> {
+    if !path.exists() {
+        return Err(format!("Folder does not exist: {}", path.display()));
+    }
+    open_in_explorer(path)
 }
 
 fn resolve_local_repo_path(current_sync: &HistorySyncSettings) -> Option<String> {
@@ -2402,6 +2346,49 @@ unsafe extern "system" fn wnd_proc(
                         Err(error) => show_error_message(hwnd, "History", &error),
                     }
                 }
+                IDM_OPEN_APP_DATA_FOLDER => {
+                    if let Err(error) = open_or_create_folder(&app_data_folder_path()) {
+                        show_error_message(hwnd, "History", &error);
+                    }
+                }
+                IDM_OPEN_LOCAL_HISTORY_FOLDER => {
+                    if let Err(error) = open_or_create_folder(&local_history_folder_path()) {
+                        show_error_message(hwnd, "History", &error);
+                    }
+                }
+                IDM_OPEN_REPORTS_FOLDER => {
+                    if let Err(error) = open_or_create_folder(&reports_folder_path()) {
+                        show_error_message(hwnd, "History", &error);
+                    }
+                }
+                IDM_OPEN_CLAUDE_SOURCE_FOLDER => {
+                    match claude_source_folder_path() {
+                        Some(path) => {
+                            if let Err(error) = open_existing_folder(&path) {
+                                show_error_message(hwnd, "History", &error);
+                            }
+                        }
+                        None => show_error_message(
+                            hwnd,
+                            "History",
+                            "Unable to determine the Claude source folder.",
+                        ),
+                    }
+                }
+                IDM_OPEN_CODEX_SOURCE_FOLDER => {
+                    match codex_source_folder_path() {
+                        Some(path) => {
+                            if let Err(error) = open_existing_folder(&path) {
+                                show_error_message(hwnd, "History", &error);
+                            }
+                        }
+                        None => show_error_message(
+                            hwnd,
+                            "History",
+                            "Unable to determine the Codex source folder.",
+                        ),
+                    }
+                }
                 IDM_ARCHIVE_HISTORY_GITHUB => {
                     let history_sync = {
                         let state = lock_state();
@@ -2710,8 +2697,6 @@ fn show_context_menu(hwnd: HWND) {
                 ),
             }
         };
-        let history_snapshot =
-            history::read_snapshot(&history_sync, archive_token_from_env().as_deref());
 
         let menu = CreatePopupMenu().unwrap();
 
@@ -2797,9 +2782,41 @@ fn show_context_menu(hwnd: HWND) {
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
 
         let history_menu = CreatePopupMenu().unwrap();
-        append_history_section(history_menu, ProviderKind::Claude, &history_snapshot.claude);
-        let _ = AppendMenuW(history_menu, MF_SEPARATOR, 0, PCWSTR::null());
-        append_history_section(history_menu, ProviderKind::Codex, &history_snapshot.codex);
+        let open_app_data_str = native_interop::wide_str("Open App Data Folder");
+        let _ = AppendMenuW(
+            history_menu,
+            MENU_ITEM_FLAGS(0),
+            IDM_OPEN_APP_DATA_FOLDER as usize,
+            PCWSTR::from_raw(open_app_data_str.as_ptr()),
+        );
+        let open_local_history_str = native_interop::wide_str("Open Local History Folder");
+        let _ = AppendMenuW(
+            history_menu,
+            MENU_ITEM_FLAGS(0),
+            IDM_OPEN_LOCAL_HISTORY_FOLDER as usize,
+            PCWSTR::from_raw(open_local_history_str.as_ptr()),
+        );
+        let open_reports_str = native_interop::wide_str("Open Reports Folder");
+        let _ = AppendMenuW(
+            history_menu,
+            MENU_ITEM_FLAGS(0),
+            IDM_OPEN_REPORTS_FOLDER as usize,
+            PCWSTR::from_raw(open_reports_str.as_ptr()),
+        );
+        let open_claude_source_str = native_interop::wide_str("Open Claude Source Folder");
+        let _ = AppendMenuW(
+            history_menu,
+            MENU_ITEM_FLAGS(0),
+            IDM_OPEN_CLAUDE_SOURCE_FOLDER as usize,
+            PCWSTR::from_raw(open_claude_source_str.as_ptr()),
+        );
+        let open_codex_source_str = native_interop::wide_str("Open Codex Source Folder");
+        let _ = AppendMenuW(
+            history_menu,
+            MENU_ITEM_FLAGS(0),
+            IDM_OPEN_CODEX_SOURCE_FOLDER as usize,
+            PCWSTR::from_raw(open_codex_source_str.as_ptr()),
+        );
         let _ = AppendMenuW(history_menu, MF_SEPARATOR, 0, PCWSTR::null());
         let export_history_str = native_interop::wide_str("Export HTML Report");
         let _ = AppendMenuW(
