@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -18,6 +18,9 @@ const HELPER_EXE_NAME: &str = "updater-helper.exe";
 const DOWNLOAD_EXE_NAME: &str = "update-download.exe";
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 const CREATE_NEW_CONSOLE: u32 = 0x00000010;
+const MAX_UPDATE_SIZE_BYTES: u64 = 100 * 1024 * 1024;
+const EXPECTED_SIGNER_SUBJECT_TOKEN: &str = "Code Zeno";
+const ALLOW_UNSIGNED_UPDATE_ENV: &str = "CCUM_ALLOW_UNSIGNED_UPDATE";
 // Keep this aligned with the package identifier used in winget-pkgs.
 const WINGET_PACKAGE_ID: &str = "CodeZeno.ClaudeCodeUsageMonitor";
 
@@ -121,6 +124,7 @@ pub fn begin_self_update(release: &ReleaseDescriptor) -> Result<(), String> {
     }
 
     download_release_asset(&release.asset_url, &partial_download_path, &download_path)?;
+    verify_downloaded_update_signature(&download_path)?;
     std::fs::copy(&current_exe, &helper_path)
         .map_err(|e| format!("Unable to prepare updater helper: {e}"))?;
 
@@ -185,15 +189,8 @@ fn fetch_latest_release() -> Result<Option<ReleaseDescriptor>, String> {
         .assets
         .iter()
         .find(|asset| asset.name.eq_ignore_ascii_case(RELEASE_ASSET_NAME))
-        .or_else(|| {
-            release
-                .assets
-                .iter()
-                .find(|asset| asset.name.to_ascii_lowercase().ends_with(".exe"))
-        })
-        .ok_or_else(|| {
-            "No Windows executable asset was found in the latest release.".to_string()
-        })?;
+        .ok_or_else(|| "No matching Windows release asset was found.".to_string())?;
+    validate_release_asset_url(&asset.browser_download_url, owner, repo)?;
 
     Ok(Some(ReleaseDescriptor {
         latest_version,
@@ -217,6 +214,16 @@ fn download_release_asset(url: &str, partial_path: &Path, final_path: &Path) -> 
         .set("User-Agent", user_agent())
         .call()
         .map_err(|e| format!("Unable to download the latest release: {e}"))?;
+    if let Some(content_length) = response
+        .header("Content-Length")
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        if content_length > MAX_UPDATE_SIZE_BYTES {
+            return Err(format!(
+                "Downloaded update is too large ({content_length} bytes); aborting."
+            ));
+        }
+    }
 
     let mut reader = response.into_reader();
     let mut file = File::create(partial_path)
@@ -229,8 +236,87 @@ fn download_release_asset(url: &str, partial_path: &Path, final_path: &Path) -> 
 
     std::fs::rename(partial_path, final_path)
         .map_err(|e| format!("Unable to finalize the downloaded update file: {e}"))?;
+    if !file_has_mz_header(final_path)? {
+        let _ = std::fs::remove_file(final_path);
+        return Err("Downloaded update is not a valid Windows executable.".to_string());
+    }
 
     Ok(())
+}
+
+fn validate_release_asset_url(url: &str, owner: &str, repo: &str) -> Result<(), String> {
+    let expected_prefix = format!("https://github.com/{owner}/{repo}/releases/download/");
+    if !url.starts_with(&expected_prefix) {
+        return Err("Release asset URL did not match the expected GitHub repository.".to_string());
+    }
+
+    let expected_suffix = format!("/{RELEASE_ASSET_NAME}");
+    if !url.ends_with(&expected_suffix) {
+        return Err("Release asset URL did not match the expected executable name.".to_string());
+    }
+
+    Ok(())
+}
+
+fn file_has_mz_header(path: &Path) -> Result<bool, String> {
+    let mut file = File::open(path)
+        .map_err(|e| format!("Unable to validate downloaded update executable: {e}"))?;
+    let mut header = [0u8; 2];
+    if file.read_exact(&mut header).is_err() {
+        return Ok(false);
+    }
+
+    Ok(header == [b'M', b'Z'])
+}
+
+fn verify_downloaded_update_signature(path: &Path) -> Result<(), String> {
+    if allow_unsigned_update_override() {
+        return Ok(());
+    }
+
+    let path_literal = path.to_string_lossy().replace('\'', "''");
+    let command = format!(
+        "$sig=Get-AuthenticodeSignature -FilePath '{path_literal}'; \
+         if($sig.Status -ne 'Valid') {{ exit 2 }}; \
+         if($sig.SignerCertificate -eq $null) {{ exit 3 }}; \
+         if($sig.SignerCertificate.Subject -notlike '*{EXPECTED_SIGNER_SUBJECT_TOKEN}*') {{ exit 4 }}"
+    );
+
+    let status = Command::new("powershell.exe")
+        .arg("-NoLogo")
+        .arg("-NoProfile")
+        .arg("-NonInteractive")
+        .arg("-Command")
+        .arg(command)
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_err(|e| format!("Unable to verify update signature: {e}"))?;
+
+    match status.code() {
+        Some(0) => Ok(()),
+        Some(2) => Err(
+            "Downloaded update failed Authenticode verification. Refusing to install.".to_string(),
+        ),
+        Some(3) => Err(
+            "Downloaded update is unsigned. Refusing to install unsigned update.".to_string(),
+        ),
+        Some(4) => Err(format!(
+            "Downloaded update signer did not match expected publisher ({EXPECTED_SIGNER_SUBJECT_TOKEN})."
+        )),
+        _ => Err("Unable to validate downloaded update signature.".to_string()),
+    }
+}
+
+fn allow_unsigned_update_override() -> bool {
+    std::env::var(ALLOW_UNSIGNED_UPDATE_ENV)
+        .map(|value| {
+            let normalized = value.trim().to_ascii_lowercase();
+            normalized == "1" || normalized == "true" || normalized == "yes"
+        })
+        .unwrap_or(false)
 }
 
 fn replace_target_binary(target: &Path, source: &Path) -> Result<(), String> {

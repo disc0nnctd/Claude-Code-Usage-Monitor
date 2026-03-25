@@ -757,9 +757,11 @@ fn is_startup_enabled() -> bool {
             return false;
         }
         let current_exe = String::from_utf16_lossy(&exe_buf[..len]);
+        let expected_command = startup_command_for_executable(&current_exe);
 
         // Case-insensitive comparison (Windows paths are case-insensitive)
         reg_value.eq_ignore_ascii_case(&current_exe)
+            || reg_value.eq_ignore_ascii_case(&expected_command)
     }
 }
 
@@ -785,15 +787,17 @@ fn set_startup_enabled(enable: bool) {
             let mut exe_buf = [0u16; 260];
             let len = GetModuleFileNameW(None, &mut exe_buf) as usize;
             if len > 0 {
-                // Write the wide string including null terminator
-                let byte_len = ((len + 1) * 2) as u32;
+                let current_exe = String::from_utf16_lossy(&exe_buf[..len]);
+                let startup_value = startup_command_for_executable(&current_exe);
+                let startup_wide = native_interop::wide_str(&startup_value);
+                let byte_len = (startup_wide.len() * 2) as u32;
                 let _ = RegSetValueExW(
                     hkey,
                     PCWSTR::from_raw(key_name.as_ptr()),
                     0,
                     REG_SZ,
                     Some(std::slice::from_raw_parts(
-                        exe_buf.as_ptr() as *const u8,
+                        startup_wide.as_ptr() as *const u8,
                         byte_len as usize,
                     )),
                 );
@@ -804,6 +808,10 @@ fn set_startup_enabled(enable: bool) {
 
         let _ = RegCloseKey(hkey);
     }
+}
+
+fn startup_command_for_executable(exe_path: &str) -> String {
+    format!("\"{exe_path}\"")
 }
 
 // Dimensions matching the C# version

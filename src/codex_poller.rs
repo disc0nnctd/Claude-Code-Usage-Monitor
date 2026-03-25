@@ -15,6 +15,7 @@ const CREATE_NO_WINDOW: u32 = 0x08000000;
 const DEFAULT_CHATGPT_BASE_URL: &str = "https://chatgpt.com/backend-api";
 const USAGE_PATH_BACKEND_API: &str = "/wham/usage";
 const USAGE_PATH_CODEX_API: &str = "/api/codex/usage";
+const ALLOW_UNTRUSTED_BASE_URL_ENV: &str = "CCUM_ALLOW_UNTRUSTED_CODEX_BASE_URL";
 
 #[derive(Debug)]
 pub enum PollError {
@@ -420,15 +421,59 @@ fn resolve_chatgpt_base_url() -> String {
             }
 
             if !value.is_empty() {
-                if value.starts_with("https://chatgpt.com") && !value.contains("/backend-api") {
-                    return format!("{value}/backend-api");
+                if let Some(sanitized) = sanitize_chatgpt_base_url(&value) {
+                    return sanitized;
                 }
-                return value;
+
+                diagnose::log(
+                    "ignoring unsafe chatgpt_base_url from config.toml; falling back to default",
+                );
             }
         }
     }
 
     DEFAULT_CHATGPT_BASE_URL.to_string()
+}
+
+fn sanitize_chatgpt_base_url(value: &str) -> Option<String> {
+    let mut url = value.trim().trim_end_matches('/').to_string();
+    if url.is_empty() {
+        return None;
+    }
+
+    if allow_untrusted_base_url_override() {
+        return Some(url);
+    }
+
+    let host = extract_https_host(&url)?;
+    if host != "chatgpt.com" && !host.ends_with(".chatgpt.com") {
+        return None;
+    }
+
+    if host == "chatgpt.com" && !url.contains("/backend-api") {
+        url.push_str("/backend-api");
+    }
+
+    Some(url)
+}
+
+fn allow_untrusted_base_url_override() -> bool {
+    std::env::var(ALLOW_UNTRUSTED_BASE_URL_ENV)
+        .map(|value| {
+            let normalized = value.trim().to_ascii_lowercase();
+            normalized == "1" || normalized == "true" || normalized == "yes"
+        })
+        .unwrap_or(false)
+}
+
+fn extract_https_host(url: &str) -> Option<&str> {
+    let rest = url.strip_prefix("https://")?;
+    let host = rest.split('/').next()?.split(':').next()?;
+    if host.is_empty() {
+        return None;
+    }
+
+    Some(host)
 }
 
 fn codex_home_dir() -> PathBuf {
@@ -451,20 +496,7 @@ fn unix_to_system_time(unix_secs: i64) -> Option<SystemTime> {
     Some(UNIX_EPOCH + Duration::from_secs(unix_secs as u64))
 }
 
-fn resolve_windows_codex_path() -> String {
-    for name in &["codex.cmd", "codex"] {
-        if Command::new(name)
-            .arg("--version")
-            .creation_flags(CREATE_NO_WINDOW)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok()
-        {
-            return name.to_string();
-        }
-    }
-
+fn resolve_windows_codex_path() -> Option<String> {
     for name in &["codex.cmd", "codex"] {
         if let Ok(output) = Command::new("where.exe")
             .arg(name)
@@ -473,17 +505,68 @@ fn resolve_windows_codex_path() -> String {
         {
             if output.status.success() {
                 let stdout = String::from_utf8_lossy(&output.stdout);
-                if let Some(first_line) = stdout.lines().next() {
-                    let path = first_line.trim().to_string();
-                    if !path.is_empty() {
-                        return path;
+                for line in stdout.lines() {
+                    let path = line.trim();
+                    if is_trusted_windows_cli_path(path) {
+                        return Some(path.to_string());
                     }
                 }
             }
         }
     }
 
-    "codex.cmd".to_string()
+    None
+}
+
+fn is_trusted_windows_cli_path(path: &str) -> bool {
+    let path = path.trim().trim_matches('"');
+    let candidate = PathBuf::from(path);
+    if !candidate.is_absolute() || !candidate.exists() {
+        return false;
+    }
+
+    let normalized_candidate = normalize_windows_path(&candidate);
+    trusted_cli_roots()
+        .into_iter()
+        .map(|root| normalize_windows_path(&root))
+        .any(|root| normalized_candidate.starts_with(&root))
+}
+
+fn trusted_cli_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+
+    if let Ok(program_files) = std::env::var("ProgramFiles") {
+        roots.push(PathBuf::from(program_files));
+    } else {
+        roots.push(PathBuf::from(r"C:\Program Files"));
+    }
+
+    if let Ok(program_files_x86) = std::env::var("ProgramFiles(x86)") {
+        roots.push(PathBuf::from(program_files_x86));
+    } else {
+        roots.push(PathBuf::from(r"C:\Program Files (x86)"));
+    }
+
+    if let Ok(appdata) = std::env::var("APPDATA") {
+        roots.push(PathBuf::from(appdata).join("npm"));
+    }
+
+    if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
+        roots.push(PathBuf::from(local_app_data).join("Programs"));
+    }
+
+    if let Some(home) = dirs::home_dir() {
+        roots.push(home.join(".local").join("bin"));
+    }
+
+    roots
+}
+
+fn normalize_windows_path(path: &PathBuf) -> String {
+    path.to_string_lossy()
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_ascii_lowercase()
 }
 
 struct CodexRpcClient {
@@ -495,7 +578,7 @@ struct CodexRpcClient {
 
 impl CodexRpcClient {
     fn start() -> Result<Self, PollError> {
-        let codex_path = resolve_windows_codex_path();
+        let codex_path = resolve_windows_codex_path().ok_or(PollError::CliUnavailable)?;
         let is_cmd = codex_path.to_ascii_lowercase().ends_with(".cmd");
 
         let mut command = if is_cmd {

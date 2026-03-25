@@ -73,7 +73,10 @@ fn cli_refresh_token(source: &CredentialSource) {
 }
 
 fn cli_refresh_windows_token() {
-    let claude_path = resolve_windows_claude_path();
+    let Some(claude_path) = resolve_windows_claude_path() else {
+        diagnose::log("unable to find a trusted Claude CLI path");
+        return;
+    };
     let is_cmd = claude_path.to_lowercase().ends_with(".cmd");
     diagnose::log(format!(
         "attempting Windows Claude token refresh via {claude_path}"
@@ -191,20 +194,7 @@ fn wait_for_refresh(child: &mut std::process::Child) {
 }
 
 /// Resolve the full path to the `claude` CLI executable.
-fn resolve_windows_claude_path() -> String {
-    for name in &["claude.cmd", "claude"] {
-        if Command::new(name)
-            .arg("--version")
-            .creation_flags(CREATE_NO_WINDOW)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok()
-        {
-            return name.to_string();
-        }
-    }
-
+fn resolve_windows_claude_path() -> Option<String> {
     for name in &["claude.cmd", "claude"] {
         if let Ok(output) = Command::new("where.exe")
             .arg(name)
@@ -213,17 +203,68 @@ fn resolve_windows_claude_path() -> String {
         {
             if output.status.success() {
                 let stdout = String::from_utf8_lossy(&output.stdout);
-                if let Some(first_line) = stdout.lines().next() {
-                    let path = first_line.trim().to_string();
-                    if !path.is_empty() {
-                        return path;
+                for line in stdout.lines() {
+                    let path = line.trim();
+                    if is_trusted_windows_cli_path(path) {
+                        return Some(path.to_string());
                     }
                 }
             }
         }
     }
 
-    "claude.cmd".to_string()
+    None
+}
+
+fn is_trusted_windows_cli_path(path: &str) -> bool {
+    let path = path.trim().trim_matches('"');
+    let candidate = PathBuf::from(path);
+    if !candidate.is_absolute() || !candidate.exists() {
+        return false;
+    }
+
+    let normalized_candidate = normalize_windows_path(&candidate);
+    trusted_cli_roots()
+        .into_iter()
+        .map(|root| normalize_windows_path(&root))
+        .any(|root| normalized_candidate.starts_with(&root))
+}
+
+fn trusted_cli_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+
+    if let Ok(program_files) = std::env::var("ProgramFiles") {
+        roots.push(PathBuf::from(program_files));
+    } else {
+        roots.push(PathBuf::from(r"C:\Program Files"));
+    }
+
+    if let Ok(program_files_x86) = std::env::var("ProgramFiles(x86)") {
+        roots.push(PathBuf::from(program_files_x86));
+    } else {
+        roots.push(PathBuf::from(r"C:\Program Files (x86)"));
+    }
+
+    if let Ok(appdata) = std::env::var("APPDATA") {
+        roots.push(PathBuf::from(appdata).join("npm"));
+    }
+
+    if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
+        roots.push(PathBuf::from(local_app_data).join("Programs"));
+    }
+
+    if let Some(home) = dirs::home_dir() {
+        roots.push(home.join(".local").join("bin"));
+    }
+
+    roots
+}
+
+fn normalize_windows_path(path: &PathBuf) -> String {
+    path.to_string_lossy()
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_ascii_lowercase()
 }
 
 fn build_agent() -> Result<ureq::Agent, PollError> {

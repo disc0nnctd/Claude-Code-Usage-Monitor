@@ -11,22 +11,24 @@ permissions:
 env:
   RELEASE_ASSET_NAME: claude-code-usage-monitor.exe
   WINGET_PACKAGE_ID: CodeZeno.ClaudeCodeUsageMonitor
+  WINGETCREATE_VERSION: v1.12.8.0
+  WINGETCREATE_SHA256: 8BD738851B524885410112678E3771B341C5C716DE60FBBECB88AB0A363ED85D
 
 jobs:
   build:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           fetch-depth: 0
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9
 
       - name: Build release binary
         run: cargo build --release
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe
         with:
           files: target/release/claude-code-usage-monitor.exe
           generate_release_notes: true
@@ -55,7 +57,7 @@ jobs:
 
       - name: Install .NET 6 runtime
         if: env.WINGETCREATE_GITHUB_TOKEN != ''
-        uses: actions/setup-dotnet@v4
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9
         with:
           dotnet-version: "6.0.x"
 
@@ -63,7 +65,17 @@ jobs:
         if: env.WINGETCREATE_GITHUB_TOKEN != ''
         shell: pwsh
         run: |
-          Invoke-WebRequest https://aka.ms/wingetcreate/latest -OutFile wingetcreate.exe
+          $url = "https://github.com/microsoft/winget-create/releases/download/$env:WINGETCREATE_VERSION/wingetcreate.exe"
+          Invoke-WebRequest $url -OutFile wingetcreate.exe
+
+      - name: Verify wingetcreate checksum
+        if: env.WINGETCREATE_GITHUB_TOKEN != ''
+        shell: pwsh
+        run: |
+          $actual = (Get-FileHash wingetcreate.exe -Algorithm SHA256).Hash.ToUpperInvariant()
+          if ($actual -ne $env:WINGETCREATE_SHA256) {
+            throw "wingetcreate checksum mismatch. expected=$env:WINGETCREATE_SHA256 actual=$actual"
+          }
 
       - name: Submit WinGet manifest update
         if: env.WINGETCREATE_GITHUB_TOKEN != ''
