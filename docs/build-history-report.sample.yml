@@ -1,0 +1,243 @@
+name: Build Token Usage Report
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - latest/history-store.json
+
+permissions:
+  contents: write
+
+jobs:
+  build-report:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout archive repo
+        uses: actions/checkout@v4
+
+      - name: Generate latest/history-report.html from latest/history-store.json
+        shell: bash
+        run: |
+          python <<'PY'
+          import html
+          import json
+          from pathlib import Path
+
+          store_path = Path("latest/history-store.json")
+          report_path = Path("latest/history-report.html")
+          store = json.loads(store_path.read_text(encoding="utf-8"))
+
+          sessions = store.get("sessions", [])
+          providers = {"claude": [], "codex": []}
+          for session in sessions:
+              providers.setdefault(session.get("provider", "unknown"), []).append(session)
+
+          def summarize(items):
+              projects = {}
+              total_cost = 0.0
+              total_in = 0
+              total_cache = 0
+              total_out = 0
+              total_reason = 0
+              for item in items:
+                  project = item.get("project_path") or "Unknown"
+                  entry = projects.setdefault(project, {
+                      "sessions": 0,
+                      "input_tokens": 0,
+                      "cached_input_tokens": 0,
+                      "output_tokens": 0,
+                      "reasoning_output_tokens": 0,
+                      "estimated_cost_usd": 0.0,
+                  })
+                  entry["sessions"] += 1
+                  entry["input_tokens"] += int(item.get("input_tokens", 0))
+                  entry["cached_input_tokens"] += int(item.get("cached_input_tokens", 0))
+                  entry["output_tokens"] += int(item.get("output_tokens", 0))
+                  entry["reasoning_output_tokens"] += int(item.get("reasoning_output_tokens", 0))
+                  entry["estimated_cost_usd"] += float(item.get("estimated_cost_usd", 0.0))
+                  total_cost += float(item.get("estimated_cost_usd", 0.0))
+                  total_in += int(item.get("input_tokens", 0))
+                  total_cache += int(item.get("cached_input_tokens", 0))
+                  total_out += int(item.get("output_tokens", 0))
+                  total_reason += int(item.get("reasoning_output_tokens", 0))
+
+              top = sorted(
+                  projects.items(),
+                  key=lambda kv: (kv[1]["estimated_cost_usd"], kv[1]["input_tokens"] + kv[1]["output_tokens"]),
+                  reverse=True,
+              )[:10]
+              return {
+                  "total_sessions": len(items),
+                  "total_projects": len(projects),
+                  "estimated_cost_usd": total_cost,
+                  "input_tokens": total_in,
+                  "cached_input_tokens": total_cache,
+                  "output_tokens": total_out,
+                  "reasoning_output_tokens": total_reason,
+                  "top_projects": top,
+              }
+
+          def token_fmt(value):
+              if value >= 1_000_000_000:
+                  return f"{value / 1_000_000_000:.1f}B"
+              if value >= 1_000_000:
+                  return f"{value / 1_000_000:.1f}M"
+              if value >= 1_000:
+                  return f"{value / 1_000:.1f}K"
+              return str(value)
+
+          def usd_fmt(value):
+              if value >= 1000:
+                  return f"${value:.0f}"
+              if value >= 100:
+                  return f"${value:.1f}"
+              return f"${value:.2f}"
+
+          def render_provider(name, summary):
+              rows = []
+              for project, entry in summary["top_projects"]:
+                  rows.append(
+                      f"<tr><td>{html.escape(Path(project).name or project)}</td>"
+                      f"<td>{html.escape(project)}</td>"
+                      f"<td>{entry['sessions']}</td>"
+                      f"<td>{token_fmt(entry['input_tokens'])}</td>"
+                      f"<td>{token_fmt(entry['cached_input_tokens'])}</td>"
+                      f"<td>{token_fmt(entry['output_tokens'])}</td>"
+                      f"<td>{token_fmt(entry['reasoning_output_tokens']) if entry['reasoning_output_tokens'] else '-'}</td>"
+                      f"<td>{usd_fmt(entry['estimated_cost_usd'])}</td></tr>"
+                  )
+              if not rows:
+                  rows.append('<tr><td colspan="8">No sessions found.</td></tr>')
+
+              return f"""
+              <section class="card">
+                <h2>{html.escape(name)}</h2>
+                <div class="stats">
+                  <div><span>Projects</span><strong>{summary['total_projects']}</strong></div>
+                  <div><span>Sessions</span><strong>{summary['total_sessions']}</strong></div>
+                  <div><span>Cost</span><strong>{usd_fmt(summary['estimated_cost_usd'])}</strong></div>
+                  <div><span>Input / Output</span><strong>{token_fmt(summary['input_tokens'])} / {token_fmt(summary['output_tokens'])}</strong></div>
+                </div>
+                <table>
+                  <thead>
+                    <tr><th>Project</th><th>Path</th><th>Sessions</th><th>Input</th><th>Cache</th><th>Output</th><th>Reasoning</th><th>Cost</th></tr>
+                  </thead>
+                  <tbody>
+                    {''.join(rows)}
+                  </tbody>
+                </table>
+              </section>
+              """
+
+          claude = summarize(providers.get("claude", []))
+          codex = summarize(providers.get("codex", []))
+          total_cost = claude["estimated_cost_usd"] + codex["estimated_cost_usd"]
+          total_sessions = claude["total_sessions"] + codex["total_sessions"]
+
+          html_doc = f"""<!DOCTYPE html>
+          <html lang="en">
+          <head>
+            <meta charset="utf-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <title>Token Usage Report</title>
+            <style>
+              body {{
+                margin: 0;
+                padding: 28px;
+                font-family: 'Segoe UI', sans-serif;
+                background: #f6f4ee;
+                color: #222;
+              }}
+              .shell {{ max-width: 1180px; margin: 0 auto; }}
+              .hero, .card {{
+                background: #fffdf8;
+                border: 1px solid #e6dfd1;
+                border-radius: 20px;
+                padding: 24px;
+                box-shadow: 0 12px 28px rgba(44, 38, 27, 0.08);
+              }}
+              .hero {{ margin-bottom: 22px; }}
+              h1, h2 {{ margin: 0 0 12px; letter-spacing: -0.03em; }}
+              .grid {{ display: grid; gap: 22px; grid-template-columns: repeat(2, minmax(0, 1fr)); }}
+              .stats {{
+                display: grid;
+                gap: 12px;
+                grid-template-columns: repeat(4, minmax(0, 1fr));
+                margin: 16px 0 18px;
+              }}
+              .stats div {{
+                background: #faf5ea;
+                border-radius: 14px;
+                padding: 14px;
+              }}
+              .stats span {{
+                display: block;
+                color: #655d53;
+                font-size: 12px;
+                text-transform: uppercase;
+                letter-spacing: 0.08em;
+              }}
+              .stats strong {{
+                display: block;
+                margin-top: 6px;
+                font-size: 22px;
+              }}
+              table {{
+                width: 100%;
+                border-collapse: collapse;
+                font-size: 13px;
+              }}
+              th, td {{
+                padding: 10px;
+                border-top: 1px solid #e6dfd1;
+                vertical-align: top;
+                text-align: left;
+              }}
+              th {{
+                color: #655d53;
+                text-transform: uppercase;
+                font-size: 11px;
+              }}
+              @media (max-width: 980px) {{
+                body {{ padding: 18px; }}
+                .grid, .stats {{ grid-template-columns: 1fr; }}
+              }}
+            </style>
+          </head>
+          <body>
+            <div class="shell">
+              <section class="hero">
+                <h1>Token Usage Report</h1>
+                <p>Generated from <code>latest/history-store.json</code> inside the archive repository.</p>
+                <div class="stats">
+                  <div><span>Sessions</span><strong>{total_sessions}</strong></div>
+                  <div><span>Estimated Cost</span><strong>{usd_fmt(total_cost)}</strong></div>
+                  <div><span>Claude Sessions</span><strong>{claude['total_sessions']}</strong></div>
+                  <div><span>Codex Sessions</span><strong>{codex['total_sessions']}</strong></div>
+                </div>
+              </section>
+              <div class="grid">
+                {render_provider('Claude', claude)}
+                {render_provider('Codex', codex)}
+              </div>
+            </div>
+          </body>
+          </html>
+          """
+
+          report_path.write_text(html_doc, encoding="utf-8")
+          PY
+
+      - name: Commit generated report
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add latest/history-report.html
+          if git diff --cached --quiet; then
+            echo "No report changes to commit."
+            exit 0
+          fi
+          git commit -m "Build latest history report"
+          git push

@@ -1,4 +1,6 @@
+use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, SystemTime};
@@ -16,8 +18,12 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::diagnose;
+use crate::history;
 use crate::localization::{self, LanguageId, Strings};
-use crate::models::{ActivitySummary, ProviderKind, UsageData};
+use crate::models::{
+    ActivitySummary, HistoryStorageMode, HistorySummary, HistorySyncSettings, ProjectUsageEntry,
+    ProviderKind, UsageData,
+};
 use crate::native_interop::{
     self, Color, TIMER_COUNTDOWN, TIMER_POLL, TIMER_RESET_POLL, WM_APP_USAGE_UPDATED,
 };
@@ -52,6 +58,7 @@ struct AppState {
     language: LanguageId,
     install_channel: InstallChannel,
     active_provider: ProviderKind,
+    history_sync: HistorySyncSettings,
     claude: ProviderState,
     codex: ProviderState,
 
@@ -122,6 +129,12 @@ const IDM_LANG_SPANISH: u16 = 42;
 const IDM_LANG_FRENCH: u16 = 43;
 const IDM_LANG_GERMAN: u16 = 44;
 const IDM_LANG_JAPANESE: u16 = 45;
+const IDM_EXPORT_HISTORY_REPORT: u16 = 46;
+const IDM_ARCHIVE_HISTORY_GITHUB: u16 = 47;
+const IDM_SET_ARCHIVE_REPO: u16 = 48;
+const IDM_FETCH_HISTORY_GITHUB: u16 = 49;
+const IDM_SETUP_HISTORY_SYNC: u16 = 50;
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 const DIVIDER_HIT_ZONE: i32 = 13; // LEFT_DIVIDER_W + DIVIDER_RIGHT_MARGIN
 
@@ -201,6 +214,8 @@ struct SettingsFile {
     language: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     active_provider: Option<ProviderKind>,
+    #[serde(default)]
+    history_sync: HistorySyncSettings,
 }
 
 impl Default for SettingsFile {
@@ -210,6 +225,7 @@ impl Default for SettingsFile {
             poll_interval_ms: default_poll_interval(),
             language: None,
             active_provider: None,
+            history_sync: HistorySyncSettings::default(),
         }
     }
 }
@@ -246,6 +262,7 @@ fn save_state_settings() {
                 .language_override
                 .map(|language| language.code().to_string()),
             active_provider: Some(s.active_provider),
+            history_sync: s.history_sync.clone(),
         });
     }
 }
@@ -412,6 +429,102 @@ fn activity_lines(activity: &ActivitySummary) -> Vec<String> {
     lines
 }
 
+fn history_summary_line(provider: ProviderKind, summary: &HistorySummary) -> String {
+    if summary.total_sessions == 0 {
+        return format!("{} history: no local history", provider_name(provider));
+    }
+
+    let mut parts = vec![
+        format!("{} history:", provider_name(provider)),
+        format!("{} sessions", summary.total_sessions),
+        format!("{} in", format_token_count(summary.input_tokens)),
+        format!("{} out", format_token_count(summary.output_tokens)),
+        format!("~{}", format_usd(summary.estimated_cost_usd)),
+    ];
+
+    if summary.cached_input_tokens > 0 {
+        parts.push(format!("{} cache", format_token_count(summary.cached_input_tokens)));
+    }
+
+    if summary.reasoning_output_tokens > 0 {
+        parts.push(format!(
+            "{} reasoning",
+            format_token_count(summary.reasoning_output_tokens)
+        ));
+    }
+
+    if summary.unpriced_sessions > 0 {
+        parts.push(format!("{} unpriced", summary.unpriced_sessions));
+    }
+
+    parts.join(" | ")
+}
+
+fn history_project_lines(summary: &HistorySummary) -> Vec<String> {
+    summary
+        .top_projects
+        .iter()
+        .take(3)
+        .enumerate()
+        .map(|(index, entry)| {
+            format!(
+                "{}. {} | {} | {} in | {} out{}",
+                index + 1,
+                trim_for_menu(&history_project_label(entry), 26),
+                format_usd(entry.estimated_cost_usd),
+                format_token_count(entry.input_tokens),
+                format_token_count(entry.output_tokens),
+                if entry.cached_input_tokens > 0 {
+                    format!(" | {} cache", format_token_count(entry.cached_input_tokens))
+                } else {
+                    String::new()
+                }
+            )
+        })
+        .collect()
+}
+
+fn history_project_label(entry: &ProjectUsageEntry) -> String {
+    let path = std::path::Path::new(&entry.project_path);
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or(&entry.project_path)
+        .to_string()
+}
+
+fn format_token_count(value: u64) -> String {
+    if value >= 1_000_000_000 {
+        format!("{:.1}B", value as f64 / 1_000_000_000.0)
+    } else if value >= 1_000_000 {
+        format!("{:.1}M", value as f64 / 1_000_000.0)
+    } else if value >= 1_000 {
+        format!("{:.1}K", value as f64 / 1_000.0)
+    } else {
+        value.to_string()
+    }
+}
+
+fn format_usd(value: f64) -> String {
+    if value >= 1000.0 {
+        format!("${:.0}", value)
+    } else if value >= 100.0 {
+        format!("${:.1}", value)
+    } else {
+        format!("${:.2}", value)
+    }
+}
+
+fn append_history_section(menu: HMENU, provider: ProviderKind, summary: &HistorySummary) {
+    append_disabled_menu_line(menu, &history_summary_line(provider, summary));
+    if summary.total_projects > 0 {
+        append_disabled_menu_line(menu, &format!("Projects: {}", summary.total_projects));
+        for line in history_project_lines(summary) {
+            append_disabled_menu_line(menu, &line);
+        }
+    }
+}
+
 fn trim_for_menu(value: &str, max_chars: usize) -> String {
     let normalized = value
         .split_whitespace()
@@ -491,6 +604,266 @@ fn show_error_message(hwnd: HWND, title: &str, message: &str) {
             PCWSTR::from_raw(title_wide.as_ptr()),
             MB_OK | MB_ICONERROR,
         );
+    }
+}
+
+fn ask_yes_no(hwnd: HWND, title: &str, message: &str) -> bool {
+    unsafe {
+        let title_wide = native_interop::wide_str(title);
+        let message_wide = native_interop::wide_str(message);
+        MessageBoxW(
+            hwnd,
+            PCWSTR::from_raw(message_wide.as_ptr()),
+            PCWSTR::from_raw(title_wide.as_ptr()),
+            MB_YESNO | MB_ICONQUESTION,
+        ) == IDYES
+    }
+}
+
+fn prompt_for_text(title: &str, prompt: &str, default_value: &str) -> Option<String> {
+    let script = format!(
+        r#"
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+
+$form = New-Object Windows.Forms.Form
+$form.Text = '{title}'
+$form.StartPosition = 'CenterScreen'
+$form.Size = New-Object Drawing.Size(700, 175)
+$form.TopMost = $true
+$form.FormBorderStyle = [Windows.Forms.FormBorderStyle]::FixedDialog
+$form.MaximizeBox = $false
+$form.MinimizeBox = $false
+
+$label = New-Object Windows.Forms.Label
+$label.Text = '{prompt}'
+$label.Location = New-Object Drawing.Point(14, 14)
+$label.Size = New-Object Drawing.Size(656, 36)
+$form.Controls.Add($label)
+
+$textbox = New-Object Windows.Forms.TextBox
+$textbox.Location = New-Object Drawing.Point(14, 58)
+$textbox.Size = New-Object Drawing.Size(656, 26)
+$textbox.Text = '{default_value}'
+$form.Controls.Add($textbox)
+
+$ok = New-Object Windows.Forms.Button
+$ok.Text = 'OK'
+$ok.Location = New-Object Drawing.Point(514, 100)
+$ok.Size = New-Object Drawing.Size(75, 28)
+$ok.DialogResult = [Windows.Forms.DialogResult]::OK
+$form.Controls.Add($ok)
+
+$cancel = New-Object Windows.Forms.Button
+$cancel.Text = 'Cancel'
+$cancel.Location = New-Object Drawing.Point(595, 100)
+$cancel.Size = New-Object Drawing.Size(75, 28)
+$cancel.DialogResult = [Windows.Forms.DialogResult]::Cancel
+$form.Controls.Add($cancel)
+
+$form.AcceptButton = $ok
+$form.CancelButton = $cancel
+
+if ($form.ShowDialog() -eq [Windows.Forms.DialogResult]::OK) {{
+    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+    Write-Output $textbox.Text
+    exit 0
+}}
+
+exit 1
+"#,
+        title = powershell_literal(title),
+        prompt = powershell_literal(prompt),
+        default_value = powershell_literal(default_value),
+    );
+
+    let output = Command::new("powershell.exe")
+        .arg("-NoProfile")
+        .arg("-Command")
+        .arg(script)
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn powershell_literal(value: &str) -> String {
+    value.replace('\'', "''")
+}
+
+fn effective_archive_repo_url(repo_override: Option<&str>) -> String {
+    repo_override
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(history::DEFAULT_ARCHIVE_REPO_URL)
+        .to_string()
+}
+
+fn archive_repo_line(sync: &HistorySyncSettings) -> String {
+    let effective = effective_archive_repo_url(sync.repo_url.as_deref());
+    if sync
+        .repo_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some()
+    {
+        format!("Archive repo: {}", trim_for_menu(&effective, 58))
+    } else {
+        format!("Archive repo: default {}", trim_for_menu(&effective, 49))
+    }
+}
+
+fn archive_branch_line(sync: &HistorySyncSettings) -> String {
+    match sync
+        .branch
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(branch) => format!("Archive branch: {}", trim_for_menu(branch, 54)),
+        None => "Archive branch: default".to_string(),
+    }
+}
+
+fn archive_token_from_env() -> Option<String> {
+    ["CCUM_GITHUB_TOKEN", "GITHUB_TOKEN"]
+        .into_iter()
+        .find_map(|name| std::env::var(name).ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn run_sync_setup(hwnd: HWND, current: &HistorySyncSettings) -> Option<HistorySyncSettings> {
+    let repo_default = current
+        .repo_url
+        .clone()
+        .unwrap_or_else(|| history::DEFAULT_ARCHIVE_REPO_URL.to_string());
+    let repo_value = prompt_for_text(
+        "GitHub Sync Setup",
+        "GitHub repo in owner/repo, https://github.com/owner/repo.git, or git@github.com:owner/repo.git form. Leave blank to use the default archive repo.",
+        &repo_default,
+    )?;
+    let repo_url = if repo_value.trim().is_empty()
+        || repo_value
+            .trim()
+            .eq_ignore_ascii_case(history::DEFAULT_ARCHIVE_REPO_URL)
+    {
+        None
+    } else {
+        Some(repo_value.trim().to_string())
+    };
+    let branch_value = prompt_for_text(
+        "GitHub Sync Setup",
+        "Branch to sync against. Leave blank to use the repository default branch.",
+        current.branch.as_deref().unwrap_or(""),
+    )?;
+    let branch = {
+        let trimmed = branch_value.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    };
+
+    let use_remote_only = ask_yes_no(
+        hwnd,
+        "GitHub Sync Setup",
+        "Use GitHub as the primary history store? Yes keeps only source logs locally and avoids persisting the app's own history database on disk.",
+    );
+    let upload_history_store = ask_yes_no(
+        hwnd,
+        "GitHub Sync Setup",
+        "Upload the compact history store to GitHub? Recommended: Yes.",
+    );
+    let upload_html_reports = ask_yes_no(
+        hwnd,
+        "GitHub Sync Setup",
+        "Upload generated HTML usage reports to GitHub? Recommended: Yes if you want a browser-ready snapshot.",
+    );
+    let prefer_remote_reports = ask_yes_no(
+        hwnd,
+        "GitHub Sync Setup",
+        "When exporting reports, prefer the GitHub copy first? Choose No to always generate reports locally.",
+    );
+    let wants_conversation_sync = ask_yes_no(
+        hwnd,
+        "GitHub Sync Setup",
+        "Allow raw conversation/session log syncing? Recommended: No. This is privacy-heavy and not lightweight.",
+    );
+    if wants_conversation_sync {
+        show_info_message(
+            hwnd,
+            "GitHub Sync Setup",
+            "Raw conversation syncing stays off in this build. It would push high-sensitivity session logs and goes against the lightweight default.",
+        );
+    }
+    let workflow_prompt = if ask_yes_no(
+        hwnd,
+        "GitHub Sync Setup",
+        "Trigger a GitHub Actions workflow after sync to build reports on GitHub? This requires a workflow file in the target repo and Actions/Workflows permission.",
+    ) {
+        prompt_for_text(
+            "Workflow File",
+            "Workflow file name to dispatch, for example build-history-report.yml. Leave blank to skip remote workflow dispatch.",
+            current.workflow_file.as_deref().unwrap_or(""),
+        )
+    } else {
+        Some(String::new())
+    }?;
+
+    Some(HistorySyncSettings {
+        repo_url,
+        branch,
+        upload_history_store,
+        upload_html_reports,
+        upload_conversations: false,
+        prefer_remote_reports,
+        workflow_file: {
+            let trimmed = workflow_prompt.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        },
+        storage_mode: if use_remote_only {
+            HistoryStorageMode::RemoteOnly
+        } else {
+            HistoryStorageMode::Local
+        },
+    })
+}
+
+fn sync_mode_line(sync: &HistorySyncSettings) -> String {
+    let mode = match sync.storage_mode {
+        HistoryStorageMode::Local => "Local store + GitHub sync",
+        HistoryStorageMode::RemoteOnly => "Remote-first, no local app store",
+    };
+    format!("Sync mode: {mode}")
+}
+
+fn sync_scopes_line(sync: &HistorySyncSettings) -> String {
+    let mut scopes = Vec::new();
+    if sync.upload_history_store {
+        scopes.push("history store");
+    }
+    if sync.upload_html_reports {
+        scopes.push("html reports");
+    }
+    if sync.upload_conversations {
+        scopes.push("conversations");
+    }
+    if scopes.is_empty() {
+        "GitHub scopes: none".to_string()
+    } else {
+        format!("GitHub scopes: {}", scopes.join(", "))
+    }
+}
+
+fn sync_report_source_line(sync: &HistorySyncSettings) -> String {
+    if sync.prefer_remote_reports {
+        "Reports: prefer GitHub copy".to_string()
+    } else {
+        "Reports: generate locally".to_string()
     }
 }
 
@@ -921,6 +1294,7 @@ pub fn run() {
         let language = localization::resolve_language(language_override);
         let install_channel = updater::current_install_channel();
         let active_provider = settings.active_provider.unwrap_or(ProviderKind::Claude);
+        let history_sync = settings.history_sync.clone();
 
         // Create as layered popup (will be reparented into taskbar)
         let title = native_interop::wide_str(language.strings().window_title);
@@ -957,6 +1331,7 @@ pub fn run() {
                 language,
                 install_channel,
                 active_provider,
+                history_sync,
                 claude: ProviderState::default(),
                 codex: ProviderState::default(),
                 poll_interval_ms: settings.poll_interval_ms,
@@ -1948,6 +2323,143 @@ unsafe extern "system" fn wnd_proc(
                 IDM_START_WITH_WINDOWS => {
                     set_startup_enabled(!is_startup_enabled());
                 }
+                IDM_EXPORT_HISTORY_REPORT => {
+                    let history_sync = {
+                        let state = lock_state();
+                        state.as_ref().map(|s| s.history_sync.clone())
+                    }
+                    .unwrap_or_default();
+                    let token = if history_sync.prefer_remote_reports {
+                        archive_token_from_env().or_else(|| {
+                            prompt_for_text(
+                                "GitHub Token",
+                                "Personal access token for GitHub report download. It is used for this export only and is not stored.",
+                                "",
+                            )
+                        })
+                    } else {
+                        archive_token_from_env()
+                    };
+
+                    match history::write_report(&history_sync, token.as_deref()) {
+                        Ok(path) => show_info_message(
+                            hwnd,
+                            "History",
+                            &format!("HTML usage report written to {}", path.display()),
+                        ),
+                        Err(error) => show_error_message(hwnd, "History", &error),
+                    }
+                }
+                IDM_ARCHIVE_HISTORY_GITHUB => {
+                    let history_sync = {
+                        let state = lock_state();
+                        state.as_ref().map(|s| s.history_sync.clone())
+                    };
+                    let token = archive_token_from_env().or_else(|| {
+                        prompt_for_text(
+                            "GitHub Token",
+                            "Personal access token for GitHub upload. It is used for this archive operation only and is not stored.",
+                            "",
+                        )
+                    });
+
+                    if let Some(token) = token {
+                        let send_hwnd = SendHwnd::from_hwnd(hwnd);
+                        std::thread::spawn(move || {
+                            let history_sync = history_sync.unwrap_or_default();
+                            match history::archive_history(&history_sync, &token) {
+                                Ok(result) => show_info_message(
+                                    send_hwnd.to_hwnd(),
+                                    "History",
+                                    &format!(
+                                        "Archived history to {}. Cleaned {} local report(s).",
+                                        result.repo_url, result.cleaned_reports
+                                    ),
+                                ),
+                                Err(error) => {
+                                    show_error_message(send_hwnd.to_hwnd(), "History", &error)
+                                }
+                            }
+                        });
+                    }
+                }
+                IDM_FETCH_HISTORY_GITHUB => {
+                    let history_sync = {
+                        let state = lock_state();
+                        state.as_ref().map(|s| s.history_sync.clone())
+                    }
+                    .unwrap_or_default();
+                    let token = archive_token_from_env().or_else(|| {
+                        prompt_for_text(
+                            "GitHub Token",
+                            "Personal access token for GitHub download. It is used for this fetch operation only and is not stored.",
+                            "",
+                        )
+                    });
+
+                    if let Some(token) = token {
+                        let send_hwnd = SendHwnd::from_hwnd(hwnd);
+                        std::thread::spawn(move || {
+                            match history::fetch_history_from_github(&history_sync, &token) {
+                                Ok(result) => show_info_message(
+                                    send_hwnd.to_hwnd(),
+                                    "History",
+                                    &format!(
+                                        "Fetched GitHub history from {}. {}",
+                                        result.repo_url, result.message
+                                    ),
+                                ),
+                                Err(error) => {
+                                    show_error_message(send_hwnd.to_hwnd(), "History", &error)
+                                }
+                            }
+                        });
+                    }
+                }
+                IDM_SET_ARCHIVE_REPO => {
+                    let current_sync = {
+                        let state = lock_state();
+                        state.as_ref().map(|s| s.history_sync.clone())
+                    }
+                    .unwrap_or_default();
+                    let default_value = effective_archive_repo_url(current_sync.repo_url.as_deref());
+                    if let Some(value) = prompt_for_text(
+                        "Archive Repo",
+                        "GitHub repo in owner/repo, https://github.com/owner/repo.git, or git@github.com:owner/repo.git form. Leave blank to use the default archive repo.",
+                        current_sync.repo_url.as_deref().unwrap_or(&default_value),
+                    ) {
+                        let trimmed = value.trim();
+                        {
+                            let mut state = lock_state();
+                            if let Some(s) = state.as_mut() {
+                                s.history_sync.repo_url = if trimmed.is_empty()
+                                    || trimmed.eq_ignore_ascii_case(history::DEFAULT_ARCHIVE_REPO_URL)
+                                {
+                                    None
+                                } else {
+                                    Some(trimmed.to_string())
+                                };
+                            }
+                        }
+                        save_state_settings();
+                    }
+                }
+                IDM_SETUP_HISTORY_SYNC => {
+                    let current_sync = {
+                        let state = lock_state();
+                        state.as_ref().map(|s| s.history_sync.clone())
+                    }
+                    .unwrap_or_default();
+                    if let Some(new_sync) = run_sync_setup(hwnd, &current_sync) {
+                        {
+                            let mut state = lock_state();
+                            if let Some(s) = state.as_mut() {
+                                s.history_sync = new_sync;
+                            }
+                        }
+                        save_state_settings();
+                    }
+                }
                 IDM_FREQ_1MIN | IDM_FREQ_5MIN | IDM_FREQ_15MIN | IDM_FREQ_1HOUR => {
                     let new_interval = match id {
                         IDM_FREQ_1MIN => POLL_1_MIN,
@@ -2015,6 +2527,7 @@ fn show_context_menu(hwnd: HWND) {
             install_channel,
             update_status,
             active_provider,
+            history_sync,
             claude_state,
             codex_state,
         ) = {
@@ -2028,6 +2541,7 @@ fn show_context_menu(hwnd: HWND) {
                     s.install_channel,
                     s.update_status.clone(),
                     s.active_provider,
+                    s.history_sync.clone(),
                     s.claude.clone(),
                     s.codex.clone(),
                 ),
@@ -2039,11 +2553,14 @@ fn show_context_menu(hwnd: HWND) {
                     InstallChannel::Portable,
                     UpdateStatus::Idle,
                     ProviderKind::Claude,
+                    HistorySyncSettings::default(),
                     ProviderState::default(),
                     ProviderState::default(),
                 ),
             }
         };
+        let history_snapshot =
+            history::read_snapshot(&history_sync, archive_token_from_env().as_deref());
 
         let menu = CreatePopupMenu().unwrap();
 
@@ -2125,6 +2642,75 @@ fn show_context_menu(hwnd: HWND) {
                 append_disabled_menu_line(menu, &line);
             }
         }
+
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+
+        let history_menu = CreatePopupMenu().unwrap();
+        append_history_section(history_menu, ProviderKind::Claude, &history_snapshot.claude);
+        let _ = AppendMenuW(history_menu, MF_SEPARATOR, 0, PCWSTR::null());
+        append_history_section(history_menu, ProviderKind::Codex, &history_snapshot.codex);
+        let _ = AppendMenuW(history_menu, MF_SEPARATOR, 0, PCWSTR::null());
+        let export_history_str = native_interop::wide_str("Export HTML Report");
+        let _ = AppendMenuW(
+            history_menu,
+            MENU_ITEM_FLAGS(0),
+            IDM_EXPORT_HISTORY_REPORT as usize,
+            PCWSTR::from_raw(export_history_str.as_ptr()),
+        );
+        let _ = AppendMenuW(history_menu, MF_SEPARATOR, 0, PCWSTR::null());
+
+        let sync_menu = CreatePopupMenu().unwrap();
+        append_disabled_menu_line(sync_menu, &archive_repo_line(&history_sync));
+        append_disabled_menu_line(sync_menu, &archive_branch_line(&history_sync));
+        append_disabled_menu_line(sync_menu, &sync_mode_line(&history_sync));
+        append_disabled_menu_line(sync_menu, &sync_scopes_line(&history_sync));
+        append_disabled_menu_line(sync_menu, &sync_report_source_line(&history_sync));
+        let _ = AppendMenuW(sync_menu, MF_SEPARATOR, 0, PCWSTR::null());
+
+        let setup_sync_str = native_interop::wide_str("Setup...");
+        let _ = AppendMenuW(
+            sync_menu,
+            MENU_ITEM_FLAGS(0),
+            IDM_SETUP_HISTORY_SYNC as usize,
+            PCWSTR::from_raw(setup_sync_str.as_ptr()),
+        );
+        let archive_repo_str = native_interop::wide_str("Set Repo...");
+        let _ = AppendMenuW(
+            sync_menu,
+            MENU_ITEM_FLAGS(0),
+            IDM_SET_ARCHIVE_REPO as usize,
+            PCWSTR::from_raw(archive_repo_str.as_ptr()),
+        );
+        let archive_history_str = native_interop::wide_str("Push To GitHub");
+        let _ = AppendMenuW(
+            sync_menu,
+            MENU_ITEM_FLAGS(0),
+            IDM_ARCHIVE_HISTORY_GITHUB as usize,
+            PCWSTR::from_raw(archive_history_str.as_ptr()),
+        );
+        let fetch_history_str = native_interop::wide_str("Pull From GitHub");
+        let _ = AppendMenuW(
+            sync_menu,
+            MENU_ITEM_FLAGS(0),
+            IDM_FETCH_HISTORY_GITHUB as usize,
+            PCWSTR::from_raw(fetch_history_str.as_ptr()),
+        );
+
+        let sync_label = native_interop::wide_str("GitHub Sync");
+        let _ = AppendMenuW(
+            history_menu,
+            MF_POPUP,
+            sync_menu.0 as usize,
+            PCWSTR::from_raw(sync_label.as_ptr()),
+        );
+
+        let history_label = native_interop::wide_str("History");
+        let _ = AppendMenuW(
+            menu,
+            MF_POPUP,
+            history_menu.0 as usize,
+            PCWSTR::from_raw(history_label.as_ptr()),
+        );
 
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
 

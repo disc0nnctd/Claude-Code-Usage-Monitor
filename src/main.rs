@@ -2,10 +2,12 @@
 
 mod codex_poller;
 mod diagnose;
+mod history;
 mod localization;
 mod models;
 mod native_interop;
 mod poller;
+mod pricing;
 mod theme;
 mod updater;
 mod window;
