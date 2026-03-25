@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 use windows::core::PCWSTR;
@@ -17,11 +17,11 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::diagnose;
 use crate::localization::{self, LanguageId, Strings};
-use crate::models::UsageData;
+use crate::models::{ActivitySummary, ProviderKind, UsageData};
 use crate::native_interop::{
     self, Color, TIMER_COUNTDOWN, TIMER_POLL, TIMER_RESET_POLL, WM_APP_USAGE_UPDATED,
 };
-use crate::poller;
+use crate::{codex_poller, poller};
 use crate::theme;
 use crate::updater::{self, InstallChannel, ReleaseDescriptor, UpdateCheckResult};
 
@@ -51,23 +51,43 @@ struct AppState {
     language_override: Option<LanguageId>,
     language: LanguageId,
     install_channel: InstallChannel,
-
-    session_percent: f64,
-    session_text: String,
-    weekly_percent: f64,
-    weekly_text: String,
-
-    data: Option<UsageData>,
+    active_provider: ProviderKind,
+    claude: ProviderState,
+    codex: ProviderState,
 
     poll_interval_ms: u32,
     retry_count: u32,
-    last_poll_ok: bool,
     update_status: UpdateStatus,
 
     tray_offset: i32,
     dragging: bool,
     drag_start_mouse_x: i32,
     drag_start_offset: i32,
+}
+
+#[derive(Clone, Debug)]
+struct ProviderState {
+    data: Option<UsageData>,
+    activity: Option<ActivitySummary>,
+    session_percent: f64,
+    session_text: String,
+    weekly_percent: f64,
+    weekly_text: String,
+    last_poll_ok: bool,
+}
+
+impl Default for ProviderState {
+    fn default() -> Self {
+        Self {
+            data: None,
+            activity: None,
+            session_percent: 0.0,
+            session_text: "--".to_string(),
+            weekly_percent: 0.0,
+            weekly_text: "--".to_string(),
+            last_poll_ok: false,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -94,6 +114,8 @@ const IDM_FREQ_1HOUR: u16 = 13;
 const IDM_START_WITH_WINDOWS: u16 = 20;
 const IDM_RESET_POSITION: u16 = 30;
 const IDM_VERSION_ACTION: u16 = 31;
+const IDM_PROVIDER_CLAUDE: u16 = 32;
+const IDM_PROVIDER_CODEX: u16 = 33;
 const IDM_LANG_SYSTEM: u16 = 40;
 const IDM_LANG_ENGLISH: u16 = 41;
 const IDM_LANG_SPANISH: u16 = 42;
@@ -140,6 +162,28 @@ fn lock_state() -> MutexGuard<'static, Option<AppState>> {
     STATE.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+fn provider_state(state: &AppState, provider: ProviderKind) -> &ProviderState {
+    match provider {
+        ProviderKind::Claude => &state.claude,
+        ProviderKind::Codex => &state.codex,
+    }
+}
+
+fn provider_state_mut(state: &mut AppState, provider: ProviderKind) -> &mut ProviderState {
+    match provider {
+        ProviderKind::Claude => &mut state.claude,
+        ProviderKind::Codex => &mut state.codex,
+    }
+}
+
+fn active_provider_state(state: &AppState) -> &ProviderState {
+    provider_state(state, state.active_provider)
+}
+
+fn active_provider_state_mut(state: &mut AppState) -> &mut ProviderState {
+    provider_state_mut(state, state.active_provider)
+}
+
 fn settings_path() -> PathBuf {
     let appdata = std::env::var("APPDATA").unwrap_or_else(|_| ".".to_string());
     PathBuf::from(appdata)
@@ -155,6 +199,8 @@ struct SettingsFile {
     poll_interval_ms: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     language: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    active_provider: Option<ProviderKind>,
 }
 
 impl Default for SettingsFile {
@@ -163,6 +209,7 @@ impl Default for SettingsFile {
             tray_offset: 0,
             poll_interval_ms: default_poll_interval(),
             language: None,
+            active_provider: None,
         }
     }
 }
@@ -198,27 +245,204 @@ fn save_state_settings() {
             language: s
                 .language_override
                 .map(|language| language.code().to_string()),
+            active_provider: Some(s.active_provider),
         });
     }
 }
 
-fn refresh_usage_texts(state: &mut AppState) {
-    if !state.last_poll_ok {
+fn refresh_provider_usage_texts(provider_state: &mut ProviderState, strings: Strings) {
+    if !provider_state.last_poll_ok {
         return;
     }
 
-    let strings = state.language.strings();
-    let Some((session_text, weekly_text)) = state.data.as_ref().map(|data| {
-        (
-            poller::format_line(&data.session, strings),
-            poller::format_line(&data.weekly, strings),
-        )
-    }) else {
+    let Some(data) = provider_state.data.as_ref() else {
         return;
     };
 
-    state.session_text = session_text;
-    state.weekly_text = weekly_text;
+    provider_state.session_text = poller::format_line(&data.session, strings);
+    provider_state.weekly_text = poller::format_line(&data.weekly, strings);
+}
+
+fn refresh_usage_texts(state: &mut AppState) {
+    let strings = state.language.strings();
+    refresh_provider_usage_texts(&mut state.claude, strings);
+    refresh_provider_usage_texts(&mut state.codex, strings);
+}
+
+fn set_provider_data(
+    state: &mut AppState,
+    provider: ProviderKind,
+    data: UsageData,
+    activity: Option<ActivitySummary>,
+) {
+    let provider_state = provider_state_mut(state, provider);
+    provider_state.session_percent = data.session.percentage;
+    provider_state.weekly_percent = data.weekly.percentage;
+    provider_state.data = Some(data);
+    provider_state.activity = activity;
+    provider_state.last_poll_ok = true;
+}
+
+fn set_provider_loading(state: &mut AppState, provider: ProviderKind) {
+    let provider_state = provider_state_mut(state, provider);
+    provider_state.session_text = "...".to_string();
+    provider_state.weekly_text = "...".to_string();
+    provider_state.last_poll_ok = false;
+}
+
+fn set_provider_unavailable(state: &mut AppState, provider: ProviderKind) {
+    let provider_state = provider_state_mut(state, provider);
+    provider_state.session_text = "--".to_string();
+    provider_state.weekly_text = "--".to_string();
+    provider_state.last_poll_ok = false;
+}
+
+fn auto_select_active_provider(state: &mut AppState) {
+    if active_provider_state(state).last_poll_ok {
+        return;
+    }
+
+    for provider in ProviderKind::ALL {
+        if provider == state.active_provider {
+            continue;
+        }
+
+        if provider_state(state, provider).last_poll_ok {
+            state.active_provider = provider;
+            break;
+        }
+    }
+}
+
+fn provider_is_selectable(provider_state: &ProviderState) -> bool {
+    provider_state.last_poll_ok || provider_state.data.is_some() || provider_state.activity.is_some()
+}
+
+fn cycle_active_provider(state: &mut AppState) -> bool {
+    let selectable: Vec<ProviderKind> = ProviderKind::ALL
+        .into_iter()
+        .filter(|provider| provider_is_selectable(provider_state(state, *provider)))
+        .collect();
+
+    if selectable.len() <= 1 {
+        return false;
+    }
+
+    let current_index = selectable
+        .iter()
+        .position(|provider| *provider == state.active_provider)
+        .unwrap_or(0);
+    let next_index = (current_index + 1) % selectable.len();
+    state.active_provider = selectable[next_index];
+    true
+}
+
+fn provider_name(provider: ProviderKind) -> &'static str {
+    match provider {
+        ProviderKind::Claude => "Claude",
+        ProviderKind::Codex => "Codex",
+    }
+}
+
+fn provider_summary_line(provider: ProviderKind, provider_state: &ProviderState) -> String {
+    format!(
+        "{}: 5h {} | 7d {}",
+        provider_name(provider),
+        provider_state.session_text,
+        provider_state.weekly_text
+    )
+}
+
+fn credits_text(data: &UsageData) -> Option<String> {
+    if data.unlimited_credits {
+        return Some("Credits: unlimited".to_string());
+    }
+
+    if data.has_credits || data.credits_remaining.unwrap_or(0.0) > 0.0 {
+        return Some(format!(
+            "Credits: {:.0}",
+            data.credits_remaining.unwrap_or_default()
+        ));
+    }
+
+    None
+}
+
+fn activity_lines(activity: &ActivitySummary) -> Vec<String> {
+    let mut lines = vec![
+        format!(
+            "Prompts: {} today | {} / 7d",
+            activity.prompts_last_24h, activity.prompts_last_7d
+        ),
+        format!(
+            "Sessions: {} today | {} / 7d",
+            activity.sessions_last_24h, activity.sessions_last_7d
+        ),
+    ];
+
+    if let Some(last_prompt) = activity.last_prompt.as_deref().filter(|value| !value.is_empty()) {
+        let suffix = activity
+            .last_prompt_at
+            .map(relative_time_text)
+            .map(|text| format!(" ({text})"))
+            .unwrap_or_default();
+        lines.push(format!(
+            "Last prompt: {}{}",
+            trim_for_menu(last_prompt, 60),
+            suffix
+        ));
+    }
+
+    lines
+}
+
+fn trim_for_menu(value: &str, max_chars: usize) -> String {
+    let normalized = value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim()
+        .to_string();
+
+    if normalized.chars().count() <= max_chars {
+        return normalized;
+    }
+
+    let mut trimmed = String::new();
+    for ch in normalized.chars().take(max_chars.saturating_sub(1)) {
+        trimmed.push(ch);
+    }
+    trimmed.push('…');
+    trimmed
+}
+
+fn relative_time_text(timestamp: SystemTime) -> String {
+    let elapsed = SystemTime::now()
+        .duration_since(timestamp)
+        .unwrap_or_default()
+        .as_secs();
+
+    if elapsed < 60 {
+        "just now".to_string()
+    } else if elapsed < 3_600 {
+        format!("{}m ago", elapsed / 60)
+    } else if elapsed < 86_400 {
+        format!("{}h ago", elapsed / 3_600)
+    } else {
+        format!("{}d ago", elapsed / 86_400)
+    }
+}
+
+fn append_disabled_menu_line(menu: HMENU, text: &str) {
+    unsafe {
+        let label = native_interop::wide_str(text);
+        let _ = AppendMenuW(
+            menu,
+            MF_GRAYED,
+            0,
+            PCWSTR::from_raw(label.as_ptr()),
+        );
+    }
 }
 
 fn set_window_title(hwnd: HWND, strings: Strings) {
@@ -575,6 +799,8 @@ const CORNER_RADIUS: i32 = 2;
 
 const LEFT_DIVIDER_W: i32 = 3;
 const DIVIDER_RIGHT_MARGIN: i32 = 10;
+const PROVIDER_BADGE_W: i32 = 26;
+const PROVIDER_BADGE_RIGHT_MARGIN: i32 = 8;
 const LABEL_WIDTH: i32 = 18;
 const LABEL_RIGHT_MARGIN: i32 = 10;
 const BAR_RIGHT_MARGIN: i32 = 4;
@@ -585,6 +811,8 @@ const WIDGET_HEIGHT: i32 = 46;
 fn total_widget_width() -> i32 {
     sc(LEFT_DIVIDER_W)
         + sc(DIVIDER_RIGHT_MARGIN)
+        + sc(PROVIDER_BADGE_W)
+        + sc(PROVIDER_BADGE_RIGHT_MARGIN)
         + sc(LABEL_WIDTH)
         + sc(LABEL_RIGHT_MARGIN)
         + (sc(SEGMENT_W) + sc(SEGMENT_GAP)) * SEGMENT_COUNT
@@ -592,6 +820,13 @@ fn total_widget_width() -> i32 {
         + sc(BAR_RIGHT_MARGIN)
         + sc(TEXT_WIDTH)
         + sc(RIGHT_MARGIN)
+}
+
+fn provider_accent(provider: ProviderKind) -> Color {
+    match provider {
+        ProviderKind::Claude => Color::from_hex("#D97757"),
+        ProviderKind::Codex => Color::from_hex("#2F9E74"),
+    }
 }
 
 pub fn run() {
@@ -646,6 +881,7 @@ pub fn run() {
         let language_override = settings.language.as_deref().and_then(LanguageId::from_code);
         let language = localization::resolve_language(language_override);
         let install_channel = updater::current_install_channel();
+        let active_provider = settings.active_provider.unwrap_or(ProviderKind::Claude);
 
         // Create as layered popup (will be reparented into taskbar)
         let title = native_interop::wide_str(language.strings().window_title);
@@ -681,14 +917,11 @@ pub fn run() {
                 language_override,
                 language,
                 install_channel,
-                session_percent: 0.0,
-                session_text: "--".to_string(),
-                weekly_percent: 0.0,
-                weekly_text: "--".to_string(),
-                data: None,
+                active_provider,
+                claude: ProviderState::default(),
+                codex: ProviderState::default(),
                 poll_interval_ms: settings.poll_interval_ms,
                 retry_count: 0,
-                last_poll_ok: false,
                 update_status: UpdateStatus::Idle,
                 tray_offset: settings.tray_offset,
                 dragging: false,
@@ -786,21 +1019,31 @@ pub fn run() {
 /// ClearType sub-pixel font rendering can be used for crisp, OS-native text.
 fn render_layered() {
     refresh_dpi();
-    let (hwnd_val, is_dark, embedded, strings, session_pct, session_text, weekly_pct, weekly_text) = {
+    let (
+        hwnd_val,
+        is_dark,
+        embedded,
+        strings,
+        active_provider,
+        session_pct,
+        session_text,
+        weekly_pct,
+        weekly_text,
+    ) = {
         let state = lock_state();
-        match state.as_ref() {
-            Some(s) => (
-                s.hwnd,
-                s.is_dark,
-                s.embedded,
-                s.language.strings(),
-                s.session_percent,
-                s.session_text.clone(),
-                s.weekly_percent,
-                s.weekly_text.clone(),
-            ),
-            None => return,
-        }
+        let Some(s) = state.as_ref() else { return };
+        let provider_state = active_provider_state(s);
+        (
+            s.hwnd,
+            s.is_dark,
+            s.embedded,
+            s.language.strings(),
+            s.active_provider,
+            provider_state.session_percent,
+            provider_state.session_text.clone(),
+            provider_state.weekly_percent,
+            provider_state.weekly_text.clone(),
+        )
     };
 
     let hwnd = hwnd_val.to_hwnd();
@@ -816,7 +1059,7 @@ fn render_layered() {
     let width = total_widget_width();
     let height = sc(WIDGET_HEIGHT);
 
-    let accent = Color::from_hex("#D97757");
+    let accent = provider_accent(active_provider);
     let track = if is_dark {
         Color::from_hex("#444444")
     } else {
@@ -876,6 +1119,7 @@ fn render_layered() {
             &accent,
             &track,
             strings,
+            active_provider,
             session_pct,
             &session_text,
             weekly_pct,
@@ -939,6 +1183,7 @@ fn paint_content(
     accent: &Color,
     track: &Color,
     strings: Strings,
+    active_provider: ProviderKind,
     session_pct: f64,
     session_text: &str,
     weekly_pct: f64,
@@ -994,6 +1239,15 @@ fn paint_content(
         let _ = DeleteObject(right_brush);
 
         let content_x = sc(LEFT_DIVIDER_W) + sc(DIVIDER_RIGHT_MARGIN);
+        let badge_rect = RECT {
+            left: content_x,
+            top: (height - sc(24)) / 2,
+            right: content_x + sc(PROVIDER_BADGE_W),
+            bottom: (height - sc(24)) / 2 + sc(24),
+        };
+        draw_provider_badge(hdc, &badge_rect, active_provider, accent);
+
+        let rows_x = content_x + sc(PROVIDER_BADGE_W) + sc(PROVIDER_BADGE_RIGHT_MARGIN);
         let row1_y = sc(5);
         let row2_y = sc(5) + sc(SEGMENT_H) + sc(10);
 
@@ -1021,7 +1275,7 @@ fn paint_content(
 
         draw_row(
             hdc,
-            content_x,
+            rows_x,
             row1_y,
             strings.session_window,
             session_pct,
@@ -1031,7 +1285,7 @@ fn paint_content(
         );
         draw_row(
             hdc,
-            content_x,
+            rows_x,
             row2_y,
             strings.weekly_window,
             weekly_pct,
@@ -1047,62 +1301,91 @@ fn paint_content(
 
 fn do_poll(send_hwnd: SendHwnd) {
     let hwnd = send_hwnd.to_hwnd();
-    match poller::poll() {
-        Ok(data) => {
-            let mut state = lock_state();
-            if let Some(s) = state.as_mut() {
-                s.session_percent = data.session.percentage;
-                s.weekly_percent = data.weekly.percentage;
-                // Stop fast-poll if reset data is now fresh
-                if !poller::is_past_reset(&data) {
-                    unsafe {
-                        let _ = KillTimer(hwnd, TIMER_RESET_POLL);
-                    }
-                }
+    let claude_handle = std::thread::spawn(poller::poll);
+    let codex_handle = std::thread::spawn(|| {
+        let activity = codex_poller::read_activity_summary();
+        (codex_poller::poll(), activity)
+    });
 
-                s.data = Some(data);
-                s.last_poll_ok = true;
-                refresh_usage_texts(s);
+    let claude_result = claude_handle
+        .join()
+        .unwrap_or(Err(poller::PollError::RequestFailed));
+    let (codex_result, codex_activity) = codex_handle
+        .join()
+        .unwrap_or((Err(codex_poller::PollError::RequestFailed), None));
+
+    let mut any_ok = false;
+    let mut needs_fast_reset_poll = false;
+
+    {
+        let mut state = lock_state();
+        if let Some(s) = state.as_mut() {
+            match claude_result {
+                Ok(data) => {
+                    needs_fast_reset_poll |= poller::is_past_reset(&data);
+                    set_provider_data(s, ProviderKind::Claude, data, None);
+                    any_ok = true;
+                }
+                Err(poller::PollError::NoCredentials | poller::PollError::TokenExpired) => {
+                    set_provider_unavailable(s, ProviderKind::Claude);
+                }
+                Err(poller::PollError::RequestFailed) => {
+                    set_provider_loading(s, ProviderKind::Claude);
+                }
+            }
 
                 // Recovered from errors — restore normal poll interval
-                if s.retry_count > 0 {
-                    s.retry_count = 0;
-                    let interval = s.poll_interval_ms;
-                    unsafe {
-                        SetTimer(hwnd, TIMER_POLL, interval, None);
-                    }
+            provider_state_mut(s, ProviderKind::Codex).activity = codex_activity;
+            match codex_result {
+                Ok(data) => {
+                    needs_fast_reset_poll |= poller::is_past_reset(&data);
+                    set_provider_data(
+                        s,
+                        ProviderKind::Codex,
+                        data,
+                        provider_state(s, ProviderKind::Codex).activity.clone(),
+                    );
+                    any_ok = true;
+                }
+                Err(codex_poller::PollError::NoCredentials | codex_poller::PollError::CliUnavailable) => {
+                    set_provider_unavailable(s, ProviderKind::Codex);
+                }
+                Err(codex_poller::PollError::RequestFailed) => {
+                    set_provider_loading(s, ProviderKind::Codex);
                 }
             }
 
-            unsafe {
-                let _ = PostMessageW(hwnd, WM_APP_USAGE_UPDATED, WPARAM(0), LPARAM(0));
-            }
-        }
-        Err(_e) => {
-            // Show refresh indicator — retry will recover silently
-            let mut state = lock_state();
-            if let Some(s) = state.as_mut() {
-                s.session_text = "...".to_string();
-                s.weekly_text = "...".to_string();
-                s.last_poll_ok = false;
-
-                // Exponential backoff retry: 30s, 60s, 120s, ... up to poll_interval
+            refresh_usage_texts(s);
+            auto_select_active_provider(s);
+            if any_ok {
+                if s.retry_count > 0 {
+                    s.retry_count = 0;
+                    unsafe {
+                        SetTimer(hwnd, TIMER_POLL, s.poll_interval_ms, None);
+                    }
+                }
+            } else {
                 s.retry_count = s.retry_count.saturating_add(1);
                 let backoff = RETRY_BASE_MS
                     .saturating_mul(1u32.checked_shl(s.retry_count - 1).unwrap_or(u32::MAX));
                 let retry_ms = backoff.min(s.poll_interval_ms);
 
                 unsafe {
-                    // Kill the 5-second reset poll so it doesn't bypass backoff
-                    let _ = KillTimer(hwnd, TIMER_RESET_POLL);
                     SetTimer(hwnd, TIMER_POLL, retry_ms, None);
                 }
             }
-
-            unsafe {
-                let _ = PostMessageW(hwnd, WM_APP_USAGE_UPDATED, WPARAM(0), LPARAM(0));
-            }
         }
+    }
+
+    unsafe {
+            // Show refresh indicator — retry will recover silently
+        if needs_fast_reset_poll {
+            SetTimer(hwnd, TIMER_RESET_POLL, 5_000, None);
+        } else {
+            let _ = KillTimer(hwnd, TIMER_RESET_POLL);
+        }
+
+        let _ = PostMessageW(hwnd, WM_APP_USAGE_UPDATED, WPARAM(0), LPARAM(0));
     }
 }
 
@@ -1113,7 +1396,11 @@ fn schedule_countdown_timer() {
         None => return,
     };
 
-    let data = match &s.data {
+    if !active_provider_state(s).last_poll_ok {
+        return;
+    }
+
+    let data = match &active_provider_state(s).data {
         Some(d) => d,
         None => return,
     };
@@ -1181,7 +1468,7 @@ fn update_display() {
     };
 
     // Don't overwrite error text with stale cached data
-    if !s.last_poll_ok {
+    if !active_provider_state(s).last_poll_ok {
         return;
     }
 
@@ -1518,6 +1805,21 @@ unsafe extern "system" fn wnd_proc(
             if was_dragging.is_some() {
                 let _ = ReleaseCapture();
                 save_state_settings();
+            } else {
+                let switched = {
+                    let mut state = lock_state();
+                    if let Some(s) = state.as_mut() {
+                        cycle_active_provider(s)
+                    } else {
+                        false
+                    }
+                };
+
+                if switched {
+                    save_state_settings();
+                    render_layered();
+                    schedule_countdown_timer();
+                }
             }
             LRESULT(0)
         }
@@ -1532,8 +1834,8 @@ unsafe extern "system" fn wnd_proc(
                     {
                         let mut state = lock_state();
                         if let Some(s) = state.as_mut() {
-                            s.session_text = "...".to_string();
-                            s.weekly_text = "...".to_string();
+                            active_provider_state_mut(s).session_text = "...".to_string();
+                            active_provider_state_mut(s).weekly_text = "...".to_string();
                         }
                     }
                     render_layered();
@@ -1587,6 +1889,22 @@ unsafe extern "system" fn wnd_proc(
                     }
                     save_state_settings();
                     position_at_taskbar();
+                }
+                IDM_PROVIDER_CLAUDE | IDM_PROVIDER_CODEX => {
+                    let new_provider = if id == IDM_PROVIDER_CODEX {
+                        ProviderKind::Codex
+                    } else {
+                        ProviderKind::Claude
+                    };
+                    {
+                        let mut state = lock_state();
+                        if let Some(s) = state.as_mut() {
+                            s.active_provider = new_provider;
+                        }
+                    }
+                    save_state_settings();
+                    render_layered();
+                    schedule_countdown_timer();
                 }
                 IDM_START_WITH_WINDOWS => {
                     set_startup_enabled(!is_startup_enabled());
@@ -1657,6 +1975,9 @@ fn show_context_menu(hwnd: HWND) {
             language_override,
             install_channel,
             update_status,
+            active_provider,
+            claude_state,
+            codex_state,
         ) = {
             let state = lock_state();
             match state.as_ref() {
@@ -1667,6 +1988,9 @@ fn show_context_menu(hwnd: HWND) {
                     s.language_override,
                     s.install_channel,
                     s.update_status.clone(),
+                    s.active_provider,
+                    s.claude.clone(),
+                    s.codex.clone(),
                 ),
                 None => (
                     POLL_15_MIN,
@@ -1675,6 +1999,9 @@ fn show_context_menu(hwnd: HWND) {
                     None,
                     InstallChannel::Portable,
                     UpdateStatus::Idle,
+                    ProviderKind::Claude,
+                    ProviderState::default(),
+                    ProviderState::default(),
                 ),
             }
         };
@@ -1688,6 +2015,73 @@ fn show_context_menu(hwnd: HWND) {
             1,
             PCWSTR::from_raw(refresh_str.as_ptr()),
         );
+
+        let providers_menu = CreatePopupMenu().unwrap();
+        for (provider, id) in [
+            (ProviderKind::Claude, IDM_PROVIDER_CLAUDE),
+            (ProviderKind::Codex, IDM_PROVIDER_CODEX),
+        ] {
+            let label = native_interop::wide_str(provider_name(provider));
+            let flags = if active_provider == provider {
+                MF_CHECKED
+            } else {
+                MENU_ITEM_FLAGS(0)
+            };
+            let _ = AppendMenuW(
+                providers_menu,
+                flags,
+                id as usize,
+                PCWSTR::from_raw(label.as_ptr()),
+            );
+        }
+
+        let providers_label = native_interop::wide_str("Providers");
+        let _ = AppendMenuW(
+            menu,
+            MF_POPUP,
+            providers_menu.0 as usize,
+            PCWSTR::from_raw(providers_label.as_ptr()),
+        );
+
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+        append_disabled_menu_line(menu, &provider_summary_line(ProviderKind::Claude, &claude_state));
+        append_disabled_menu_line(menu, &provider_summary_line(ProviderKind::Codex, &codex_state));
+
+        if let Some(data) = codex_state.data.as_ref() {
+            if let Some(plan) = data.plan_name.as_deref().filter(|value| !value.is_empty()) {
+                append_disabled_menu_line(menu, &format!("Codex plan: {plan}"));
+            }
+
+            if let Some(source) = data.source_label.as_deref().filter(|value| !value.is_empty()) {
+                append_disabled_menu_line(menu, &format!("Codex source: {source}"));
+            }
+
+            if let Some(updated_at) = data.updated_at {
+                append_disabled_menu_line(
+                    menu,
+                    &format!("Codex updated: {}", relative_time_text(updated_at)),
+                );
+            }
+
+            if let Some(review) = data.review.as_ref() {
+                append_disabled_menu_line(
+                    menu,
+                    &format!("Code review: {}", poller::format_line(review, strings)),
+                );
+            }
+
+            if let Some(credits) = credits_text(data) {
+                append_disabled_menu_line(menu, &credits);
+            }
+        }
+
+        if let Some(activity) = codex_state.activity.as_ref() {
+            for line in activity_lines(activity) {
+                append_disabled_menu_line(menu, &line);
+            }
+        }
+
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
 
         // Update Frequency submenu
         let freq_menu = CreatePopupMenu().unwrap();
@@ -1837,22 +2231,31 @@ fn show_context_menu(hwnd: HWND) {
 
 /// Paint for non-embedded fallback (normal WM_PAINT path)
 fn paint(hdc: HDC, hwnd: HWND) {
-    let (is_dark, strings, session_pct, session_text, weekly_pct, weekly_text) = {
+    let (
+        is_dark,
+        strings,
+        active_provider,
+        session_pct,
+        session_text,
+        weekly_pct,
+        weekly_text,
+    ) = {
         let state = lock_state();
         match state.as_ref() {
             Some(s) => (
                 s.is_dark,
                 s.language.strings(),
-                s.session_percent,
-                s.session_text.clone(),
-                s.weekly_percent,
-                s.weekly_text.clone(),
+                s.active_provider,
+                active_provider_state(s).session_percent,
+                active_provider_state(s).session_text.clone(),
+                active_provider_state(s).weekly_percent,
+                active_provider_state(s).weekly_text.clone(),
             ),
             None => return,
         }
     };
 
-    let accent = Color::from_hex("#D97757");
+    let accent = provider_accent(active_provider);
     let track = if is_dark {
         Color::from_hex("#444444")
     } else {
@@ -1893,6 +2296,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
             &accent,
             &track,
             strings,
+            active_provider,
             session_pct,
             &session_text,
             weekly_pct,
@@ -1999,6 +2403,44 @@ fn draw_row(
             &mut text_rect,
             DT_LEFT | DT_VCENTER | DT_SINGLELINE,
         );
+    }
+}
+
+fn draw_provider_badge(hdc: HDC, rect: &RECT, provider: ProviderKind, accent: &Color) {
+    draw_rounded_rect(hdc, rect, accent, sc(4));
+
+    unsafe {
+        let font_name = native_interop::wide_str("Segoe UI");
+        let font = CreateFontW(
+            sc(-10),
+            0,
+            0,
+            0,
+            FW_SEMIBOLD.0 as i32,
+            0,
+            0,
+            0,
+            DEFAULT_CHARSET.0 as u32,
+            OUT_TT_PRECIS.0 as u32,
+            CLIP_DEFAULT_PRECIS.0 as u32,
+            CLEARTYPE_QUALITY.0 as u32,
+            (DEFAULT_PITCH.0 | FF_DONTCARE.0) as u32,
+            PCWSTR::from_raw(font_name.as_ptr()),
+        );
+        let old_font = SelectObject(hdc, font);
+        let _ = SetTextColor(hdc, COLORREF(native_interop::colorref(255, 255, 255)));
+
+        let mut text: Vec<u16> = provider.short_label().encode_utf16().collect();
+        let mut text_rect = *rect;
+        let _ = DrawTextW(
+            hdc,
+            &mut text,
+            &mut text_rect,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+        );
+
+        SelectObject(hdc, old_font);
+        let _ = DeleteObject(font);
     }
 }
 

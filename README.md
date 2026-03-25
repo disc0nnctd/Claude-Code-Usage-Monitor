@@ -1,8 +1,8 @@
-# Claude Code Usage Monitor
+# Claude Code + Codex Usage Monitor
 
-A lightweight Windows taskbar widget for people already using Claude Code.
+A lightweight Windows taskbar widget for people using Claude Code, OpenAI Codex, or both.
 
-It sits in your taskbar and shows how much of your Claude Code usage window you have left, without needing to open the terminal or the Claude site.
+It sits in your taskbar and shows how much of your Claude Code or Codex usage window you have left, without needing to open the terminal or the provider site.
 
 ![Windows](https://img.shields.io/badge/platform-Windows-blue)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -11,24 +11,28 @@ It sits in your taskbar and shows how much of your Claude Code usage window you 
 
 ## What You Get
 
-- A **5h** bar for your current 5-hour Claude usage window
-- A **7d** bar for your current 7-day window
-- A live countdown until each limit resets
+- Claude Code tracking with **5h** and **7d** usage bars
+- Codex tracking with **5h** and **7d** usage bars
+- A live countdown until the active provider resets
+- Left-click to switch between Claude and Codex
+- Right-click provider summaries including Codex plan, code review, recent prompt/session counts, and last prompt preview
 - A small native widget that lives directly in the Windows taskbar
 - Right-click options for refresh, update frequency, language, startup, and updates
 
 ## Who This Is For
 
-This app is for Windows users who already have **Claude Code (CLI or App) installed and signed in**.
+This app is for Windows users who already have **Claude Code**, **Codex**, or both installed and signed in.
 
-It works best if you want a simple "how close am I to the limit?" display that is always visible.
+It works best if you want a simple "how close am I to the limit?" display that is always visible, plus a quick menu to inspect recent Codex activity.
 
 ## Requirements
 
 - Windows 10 or Windows 11
-- Claude Code (CLI or App) installed and authenticated
+- Claude Code (CLI or App) installed and authenticated for Claude tracking
+- Codex CLI installed and authenticated for Codex tracking
 
 If you use Claude Code through WSL, that is supported too. The monitor can read your Claude Code credentials from Windows or from your WSL environment.
+Codex usage is read from your local `%USERPROFILE%\.codex` data on Windows.
 
 ## Install
 
@@ -47,12 +51,19 @@ winget install CodeZeno.ClaudeCodeUsageMonitor
 Run the app and it will appear in your taskbar.
 
 - Drag the left divider to move it
-- Right-click for refresh, update frequency, start with Windows, reset position, language, updates, and exit
+- Left-click anywhere except the divider to switch the active provider
+- Right-click for refresh, provider selection, update frequency, provider summaries, start with Windows, reset position, language, updates, and exit
 
 Settings are saved to:
 
 ```text
 %APPDATA%\ClaudeCodeUsageMonitor\settings.json
+```
+
+To build from source:
+
+```powershell
+cargo build --release
 ```
 
 ## Account Support
@@ -74,10 +85,14 @@ What the app reads:
 
 - Your local Claude Code OAuth credentials from `~/.claude/.credentials.json`
 - If needed, the same credentials file inside an installed WSL distro
+- Your local Codex auth file from `~/.codex/auth.json`
+- Your local Codex prompt history from `~/.codex/history.jsonl` for recent-activity summaries
 
 What the app sends over the network:
 
 - Requests to Anthropic's Claude endpoints to read your usage and rate-limit information
+- Requests to OpenAI's Codex usage endpoint to read your Codex limits
+- If needed, a local `codex app-server` probe to read Codex rate limits from the installed CLI
 - Requests to GitHub only if you use the app's update check / self-update feature
 
 What the app stores locally:
@@ -103,9 +118,11 @@ Notes:
 The monitor:
 
 1. Finds your Claude Code login credentials
-2. Reads your current usage from Anthropic
-3. Shows the result directly in the Windows taskbar
-4. Refreshes periodically in the background
+2. Finds your Codex login state and recent local history
+3. Reads your current usage from Anthropic and OpenAI
+4. Falls back to the local Codex CLI rate-limit RPC if the Codex web usage endpoint is unavailable
+5. Shows the active provider directly in the Windows taskbar
+6. Refreshes periodically in the background
 
 If the newer usage endpoint is unavailable, it can fall back to reading the rate-limit headers returned by Claude's Messages API.
 
