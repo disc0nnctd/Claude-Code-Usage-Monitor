@@ -26,7 +26,7 @@ use crate::models::{
 use crate::native_interop::{
     self, Color, TIMER_COUNTDOWN, TIMER_POLL, TIMER_RESET_POLL, WM_APP_USAGE_UPDATED,
 };
-use crate::{codex_poller, poller};
+use crate::{codex_poller, poller, secret_store};
 use crate::theme;
 use crate::updater::{self, InstallChannel, ReleaseDescriptor, UpdateCheckResult};
 
@@ -141,6 +141,8 @@ const IDM_OPEN_LOCAL_HISTORY_FOLDER: u16 = 55;
 const IDM_OPEN_REPORTS_FOLDER: u16 = 56;
 const IDM_OPEN_CLAUDE_SOURCE_FOLDER: u16 = 57;
 const IDM_OPEN_CODEX_SOURCE_FOLDER: u16 = 58;
+const IDM_SET_GITHUB_TOKEN: u16 = 59;
+const IDM_CLEAR_GITHUB_TOKEN: u16 = 60;
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 const DIVIDER_HIT_ZONE: i32 = 13; // LEFT_DIVIDER_W + DIVIDER_RIGHT_MARGIN
@@ -608,11 +610,7 @@ fn powershell_literal(value: &str) -> String {
 }
 
 fn effective_archive_repo_url(repo_override: Option<&str>) -> String {
-    repo_override
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or(history::DEFAULT_ARCHIVE_REPO_URL)
-        .to_string()
+    history::effective_archive_repo_url(repo_override)
 }
 
 fn archive_repo_line(sync: &HistorySyncSettings) -> String {
@@ -654,12 +652,26 @@ fn local_repo_line(sync: &HistorySyncSettings) -> String {
     }
 }
 
+fn github_token_line() -> String {
+    if archive_token_from_env().is_some() {
+        "PAT: env".to_string()
+    } else if secret_store::has_github_pat() {
+        "PAT: saved securely".to_string()
+    } else {
+        "PAT: not set".to_string()
+    }
+}
+
 fn archive_token_from_env() -> Option<String> {
     ["CCUM_GITHUB_TOKEN", "GITHUB_TOKEN"]
         .into_iter()
         .find_map(|name| std::env::var(name).ok())
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+fn archive_token_from_sources() -> Option<String> {
+    archive_token_from_env().or_else(secret_store::load_github_pat)
 }
 
 fn effective_local_repo_path(sync: &HistorySyncSettings) -> Option<String> {
@@ -2326,7 +2338,7 @@ unsafe extern "system" fn wnd_proc(
                     }
                     .unwrap_or_default();
                     let token = if history_sync.prefer_remote_reports {
-                        archive_token_from_env().or_else(|| {
+                        archive_token_from_sources().or_else(|| {
                             prompt_for_text(
                                 "GitHub Token",
                                 "Personal access token for GitHub report download. It is used for this export only and is not stored.",
@@ -2334,7 +2346,7 @@ unsafe extern "system" fn wnd_proc(
                             )
                         })
                     } else {
-                        archive_token_from_env()
+                        archive_token_from_sources()
                     };
 
                     match history::write_report(&history_sync, token.as_deref()) {
@@ -2394,7 +2406,7 @@ unsafe extern "system" fn wnd_proc(
                         let state = lock_state();
                         state.as_ref().map(|s| s.history_sync.clone())
                     };
-                    let token = archive_token_from_env().or_else(|| {
+                    let token = archive_token_from_sources().or_else(|| {
                         prompt_for_text(
                             "GitHub Token",
                             "Personal access token for GitHub upload. It is used for this archive operation only and is not stored.",
@@ -2428,7 +2440,7 @@ unsafe extern "system" fn wnd_proc(
                         state.as_ref().map(|s| s.history_sync.clone())
                     }
                     .unwrap_or_default();
-                    let token = archive_token_from_env().or_else(|| {
+                    let token = archive_token_from_sources().or_else(|| {
                         prompt_for_text(
                             "GitHub Token",
                             "Personal access token for GitHub download. It is used for this fetch operation only and is not stored.",
@@ -2483,13 +2495,54 @@ unsafe extern "system" fn wnd_proc(
                         save_state_settings();
                     }
                 }
+                IDM_SET_GITHUB_TOKEN => {
+                    if let Some(token) = prompt_for_text(
+                        "GitHub Token",
+                        "GitHub personal access token to save in Windows Credential Manager. It is stored encrypted for this Windows user and not written to settings.json.\n\nClassic tokens start with ghp_ and fine-grained tokens start with github_pat_.",
+                        "",
+                    ) {
+                        if let Err(error) = history::validate_github_token_format(&token) {
+                            show_error_message(hwnd, "GitHub Token", &error);
+                        } else {
+                            let send_hwnd = SendHwnd::from_hwnd(hwnd);
+                            let token_clone = token.clone();
+                            std::thread::spawn(move || {
+                                match history::validate_github_token_live(&token_clone) {
+                                    Ok(username) => {
+                                        match secret_store::save_github_pat(&token_clone) {
+                                            Ok(()) => show_info_message(
+                                                send_hwnd.to_hwnd(),
+                                                "GitHub Token",
+                                                &format!("Token verified (user: {username}) and saved in Windows Credential Manager."),
+                                            ),
+                                            Err(error) => show_error_message(send_hwnd.to_hwnd(), "GitHub Token", &error),
+                                        }
+                                    }
+                                    Err(error) => show_error_message(
+                                        send_hwnd.to_hwnd(),
+                                        "GitHub Token",
+                                        &format!("Token validation failed: {error}"),
+                                    ),
+                                }
+                            });
+                        }
+                    }
+                }
+                IDM_CLEAR_GITHUB_TOKEN => match secret_store::clear_github_pat() {
+                    Ok(()) => show_info_message(
+                        hwnd,
+                        "GitHub Token",
+                        "Removed saved GitHub token from Windows Credential Manager.",
+                    ),
+                    Err(error) => show_error_message(hwnd, "GitHub Token", &error),
+                },
                 IDM_INSTALL_WORKFLOW_GITHUB => {
                     let history_sync = {
                         let state = lock_state();
                         state.as_ref().map(|s| s.history_sync.clone())
                     }
                     .unwrap_or_default();
-                    let token = archive_token_from_env().or_else(|| {
+                    let token = archive_token_from_sources().or_else(|| {
                         prompt_for_text(
                             "GitHub Token",
                             "Personal access token for workflow installation. It is used only for this upload and is not stored. Modifying .github/workflows requires workflow-related GitHub token permissions.",
@@ -2831,6 +2884,7 @@ fn show_context_menu(hwnd: HWND) {
         append_disabled_menu_line(sync_menu, &archive_repo_line(&history_sync));
         append_disabled_menu_line(sync_menu, &archive_branch_line(&history_sync));
         append_disabled_menu_line(sync_menu, &local_repo_line(&history_sync));
+        append_disabled_menu_line(sync_menu, &github_token_line());
         append_disabled_menu_line(sync_menu, &sync_mode_line(&history_sync));
         append_disabled_menu_line(sync_menu, &sync_scopes_line(&history_sync));
         append_disabled_menu_line(sync_menu, &sync_report_source_line(&history_sync));
@@ -2850,6 +2904,21 @@ fn show_context_menu(hwnd: HWND) {
             IDM_SET_ARCHIVE_REPO as usize,
             PCWSTR::from_raw(archive_repo_str.as_ptr()),
         );
+        let set_github_token_str = native_interop::wide_str("Set Saved Token...");
+        let _ = AppendMenuW(
+            sync_menu,
+            MENU_ITEM_FLAGS(0),
+            IDM_SET_GITHUB_TOKEN as usize,
+            PCWSTR::from_raw(set_github_token_str.as_ptr()),
+        );
+        let clear_github_token_str = native_interop::wide_str("Clear Saved Token");
+        let _ = AppendMenuW(
+            sync_menu,
+            MENU_ITEM_FLAGS(0),
+            IDM_CLEAR_GITHUB_TOKEN as usize,
+            PCWSTR::from_raw(clear_github_token_str.as_ptr()),
+        );
+        let _ = AppendMenuW(sync_menu, MF_SEPARATOR, 0, PCWSTR::null());
         let archive_history_str = native_interop::wide_str("Push To GitHub");
         let _ = AppendMenuW(
             sync_menu,

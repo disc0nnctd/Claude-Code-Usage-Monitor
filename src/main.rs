@@ -8,6 +8,7 @@ mod models;
 mod native_interop;
 mod poller;
 mod pricing;
+mod secret_store;
 mod theme;
 mod updater;
 mod window;

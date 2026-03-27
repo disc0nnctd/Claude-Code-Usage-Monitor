@@ -1098,9 +1098,11 @@ pub fn archive_history(sync: &HistorySyncSettings, token: &str) -> Result<Archiv
     let store = refresh_store(sync)?;
     let snapshot = summarize_store(&store);
     let generated_at_unix = unix_now();
+    let agent = github_agent();
 
     if sync.upload_history_store {
-        upload_github_file(
+        upload_github_file_with_agent(
+            &agent,
             &repo,
             token,
             sync.branch.as_deref(),
@@ -1111,7 +1113,8 @@ pub fn archive_history(sync: &HistorySyncSettings, token: &str) -> Result<Archiv
         )?;
     }
     if sync.upload_html_reports {
-        upload_github_file(
+        upload_github_file_with_agent(
+            &agent,
             &repo,
             token,
             sync.branch.as_deref(),
@@ -1696,7 +1699,7 @@ fn summarize_projects(projects: HashMap<String, ProjectAccumulator>) -> HistoryS
     summary
 }
 
-fn effective_archive_repo_url(repo_spec: Option<&str>) -> String {
+pub fn effective_archive_repo_url(repo_spec: Option<&str>) -> String {
     repo_spec
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -1709,6 +1712,58 @@ fn effective_archive_branch(branch: Option<&str>) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
+}
+
+/// Validates that a token looks like a GitHub PAT (classic `ghp_` or fine-grained `github_pat_`).
+/// Returns `Ok(())` on success or a user-friendly error describing the expected format.
+pub fn validate_github_token_format(token: &str) -> Result<(), String> {
+    let token = token.trim();
+    if token.is_empty() {
+        return Err("GitHub token cannot be empty.".to_string());
+    }
+    if token.starts_with("ghp_") || token.starts_with("github_pat_") {
+        Ok(())
+    } else {
+        Err(
+            "Token does not look like a GitHub personal access token. Classic tokens start with ghp_ and fine-grained tokens start with github_pat_."
+                .to_string(),
+        )
+    }
+}
+
+/// Calls the GitHub `/user` endpoint to verify a token is valid and returns the authenticated
+/// username on success.
+pub fn validate_github_token_live(token: &str) -> Result<String, String> {
+    let token = token.trim();
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(15))
+        .build();
+    match agent
+        .get("https://api.github.com/user")
+        .set("Accept", "application/vnd.github+json")
+        .set("Authorization", &format!("Bearer {token}"))
+        .set("User-Agent", "ClaudeCodeUsageMonitor")
+        .set("X-GitHub-Api-Version", "2022-11-28")
+        .call()
+    {
+        Ok(response) => {
+            #[derive(Deserialize)]
+            struct GhUser {
+                login: String,
+            }
+            let user: GhUser = response
+                .into_json()
+                .map_err(|error| format!("Token accepted but unable to parse response: {error}"))?;
+            Ok(user.login)
+        }
+        Err(ureq::Error::Status(401, _)) => {
+            Err("Token is invalid or has been revoked.".to_string())
+        }
+        Err(ureq::Error::Status(403, _)) => {
+            Err("Token was rejected (403 Forbidden). It may lack the required scopes or be IP-restricted.".to_string())
+        }
+        Err(error) => Err(format!("Unable to validate token: {error}")),
+    }
 }
 
 fn workflow_file_name(value: Option<&str>) -> Result<String, String> {
@@ -1776,6 +1831,12 @@ fn parse_github_repo_spec(value: &str) -> Result<GitHubRepoSpec, String> {
     })
 }
 
+fn github_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(30))
+        .build()
+}
+
 fn upload_github_file(
     repo: &GitHubRepoSpec,
     token: &str,
@@ -1784,10 +1845,19 @@ fn upload_github_file(
     content: &[u8],
     message: &str,
 ) -> Result<(), String> {
-    let agent = ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(30))
-        .build();
-    let sha = fetch_github_file_sha(&agent, repo, token, branch, path)?;
+    upload_github_file_with_agent(&github_agent(), repo, token, branch, path, content, message)
+}
+
+fn upload_github_file_with_agent(
+    agent: &ureq::Agent,
+    repo: &GitHubRepoSpec,
+    token: &str,
+    branch: Option<&str>,
+    path: &str,
+    content: &[u8],
+    message: &str,
+) -> Result<(), String> {
+    let sha = fetch_github_file_sha(agent, repo, token, branch, path)?;
 
     let mut body = serde_json::Map::new();
     body.insert("message".to_string(), Value::String(message.to_string()));
@@ -1813,7 +1883,8 @@ fn upload_github_file(
     {
         Ok(_) => Ok(()),
         Err(ureq::Error::Status(code, response)) => Err(format!(
-            "GitHub upload failed for {path}: HTTP {code} {}",
+            "GitHub upload failed for {path}: HTTP {code}{} {}",
+            github_error_hint(code),
             compact_response_body(response.into_string().unwrap_or_default())
         )),
         Err(error) => Err(format!("GitHub upload failed for {path}: {error}")),
@@ -1860,9 +1931,7 @@ fn download_github_file(
     branch: Option<&str>,
     path: &str,
 ) -> Result<Option<Vec<u8>>, String> {
-    let agent = ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(30))
-        .build();
+    let agent = github_agent();
     let url = github_contents_url(repo, path, branch);
     match agent
         .get(&url)
@@ -1882,7 +1951,8 @@ fn download_github_file(
         }
         Err(ureq::Error::Status(404, _)) => Ok(None),
         Err(ureq::Error::Status(code, response)) => Err(format!(
-            "Unable to download GitHub file {path}: HTTP {code} {}",
+            "Unable to download GitHub file {path}: HTTP {code}{} {}",
+            github_error_hint(code),
             compact_response_body(response.into_string().unwrap_or_default())
         )),
         Err(error) => Err(format!("Unable to download GitHub file {path}: {error}")),
@@ -1913,7 +1983,8 @@ fn fetch_github_file_sha(
         }
         Err(ureq::Error::Status(404, _)) => Ok(None),
         Err(ureq::Error::Status(code, response)) => Err(format!(
-            "Unable to check existing GitHub file {path}: HTTP {code} {}",
+            "Unable to check existing GitHub file {path}: HTTP {code}{} {}",
+            github_error_hint(code),
             compact_response_body(response.into_string().unwrap_or_default())
         )),
         Err(error) => Err(format!("Unable to check existing GitHub file {path}: {error}")),
@@ -1926,9 +1997,7 @@ fn trigger_report_workflow(
     branch: Option<&str>,
     workflow_file: &str,
 ) -> Result<(), String> {
-    let agent = ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(30))
-        .build();
+    let agent = github_agent();
     let workflow_ref = if let Some(branch) = effective_archive_branch(branch) {
         branch
     } else {
@@ -1961,8 +2030,9 @@ fn trigger_report_workflow(
     {
         Ok(_) => Ok(()),
         Err(ureq::Error::Status(code, response)) => Err(format!(
-            "Unable to trigger GitHub workflow {}: HTTP {code} {}",
+            "Unable to trigger GitHub workflow {}: HTTP {code}{} {}",
             workflow_file,
+            github_error_hint(code),
             compact_response_body(response.into_string().unwrap_or_default())
         )),
         Err(error) => Err(format!(
@@ -1989,7 +2059,22 @@ fn compact_response_body(body: String) -> String {
     if compact.is_empty() {
         String::new()
     } else {
-        format!("- {}", trim_to_chars(&compact, 180))
+        // Strip fields that could leak credentials or internal details.
+        let sanitized = compact
+            .replace(|c: char| c.is_ascii_control(), "");
+        format!("- {}", trim_to_chars(&sanitized, 180))
+    }
+}
+
+/// Returns a user-friendly hint for common GitHub HTTP error codes.
+fn github_error_hint(code: u16) -> &'static str {
+    match code {
+        401 => " (token is invalid or has been revoked)",
+        403 => " (token may lack required permissions or scopes)",
+        404 => " (repository or path not found — check the repo URL and token scope)",
+        409 => " (conflict — the file may have been modified concurrently)",
+        422 => " (unprocessable — check that the branch exists and content is valid)",
+        _ => "",
     }
 }
 
