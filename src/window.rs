@@ -143,6 +143,7 @@ const IDM_OPEN_CLAUDE_SOURCE_FOLDER: u16 = 57;
 const IDM_OPEN_CODEX_SOURCE_FOLDER: u16 = 58;
 const IDM_SET_GITHUB_TOKEN: u16 = 59;
 const IDM_CLEAR_GITHUB_TOKEN: u16 = 60;
+const IDM_TOGGLE_CONVERSATION_SYNC: u16 = 61;
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 const DIVIDER_HIT_ZONE: i32 = 13; // LEFT_DIVIDER_W + DIVIDER_RIGHT_MARGIN
@@ -801,7 +802,7 @@ fn run_sync_setup(hwnd: HWND, current: &HistorySyncSettings) -> Option<HistorySy
         show_info_message(
             hwnd,
             "GitHub Sync Setup",
-            "Raw conversation syncing stays off in this build. It would push high-sensitivity session logs and goes against the lightweight default.",
+            "Raw conversation syncing is enabled for this configuration. It will upload .claude and .codex session logs to GitHub and may be slower on large histories.",
         );
     }
     let workflow_prompt = if ask_yes_no(
@@ -827,7 +828,7 @@ fn run_sync_setup(hwnd: HWND, current: &HistorySyncSettings) -> Option<HistorySy
         local_repo_path,
         upload_history_store,
         upload_html_reports,
-        upload_conversations: false,
+        upload_conversations: wants_conversation_sync,
         prefer_remote_reports,
         workflow_file: {
             let trimmed = workflow_prompt.trim();
@@ -2419,14 +2420,25 @@ unsafe extern "system" fn wnd_proc(
                         std::thread::spawn(move || {
                             let history_sync = history_sync.unwrap_or_default();
                             match history::archive_history(&history_sync, &token) {
-                                Ok(result) => show_info_message(
-                                    send_hwnd.to_hwnd(),
-                                    "History",
-                                    &format!(
+                                Ok(result) => {
+                                    let mut message = format!(
                                         "Archived history to {}. Cleaned {} local report(s).",
                                         result.repo_url, result.cleaned_reports
-                                    ),
-                                ),
+                                    );
+                                    if result.uploaded_conversation_files > 0 {
+                                        message.push_str(&format!(
+                                            "\n\nUploaded {} raw conversation log file(s).",
+                                            result.uploaded_conversation_files
+                                        ));
+                                    }
+                                    if let Some(warning) = result.workflow_warning {
+                                        message.push_str(
+                                            "\n\nHistory files were uploaded, but the optional workflow dispatch failed:\n",
+                                        );
+                                        message.push_str(&warning);
+                                    }
+                                    show_info_message(send_hwnd.to_hwnd(), "History", &message)
+                                }
                                 Err(error) => {
                                     show_error_message(send_hwnd.to_hwnd(), "History", &error)
                                 }
@@ -2649,6 +2661,26 @@ unsafe extern "system" fn wnd_proc(
                             }
                         }
                         save_state_settings();
+                    }
+                }
+                IDM_TOGGLE_CONVERSATION_SYNC => {
+                    let enabled = {
+                        let mut state = lock_state();
+                        if let Some(s) = state.as_mut() {
+                            s.history_sync.upload_conversations =
+                                !s.history_sync.upload_conversations;
+                            s.history_sync.upload_conversations
+                        } else {
+                            false
+                        }
+                    };
+                    save_state_settings();
+                    if enabled {
+                        show_info_message(
+                            hwnd,
+                            "GitHub Sync",
+                            "Raw conversation syncing is enabled. Push To GitHub will upload .claude and .codex session logs to the configured archive repo.",
+                        );
                     }
                 }
                 IDM_FREQ_1MIN | IDM_FREQ_5MIN | IDM_FREQ_15MIN | IDM_FREQ_1HOUR => {
@@ -2896,6 +2928,17 @@ fn show_context_menu(hwnd: HWND) {
             MENU_ITEM_FLAGS(0),
             IDM_SETUP_HISTORY_SYNC as usize,
             PCWSTR::from_raw(setup_sync_str.as_ptr()),
+        );
+        let sync_conversations_str = native_interop::wide_str("Sync Raw Conversations");
+        let _ = AppendMenuW(
+            sync_menu,
+            if history_sync.upload_conversations {
+                MF_CHECKED
+            } else {
+                MENU_ITEM_FLAGS(0)
+            },
+            IDM_TOGGLE_CONVERSATION_SYNC as usize,
+            PCWSTR::from_raw(sync_conversations_str.as_ptr()),
         );
         let archive_repo_str = native_interop::wide_str("Set Repo...");
         let _ = AppendMenuW(

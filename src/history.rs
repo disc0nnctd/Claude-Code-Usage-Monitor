@@ -181,6 +181,8 @@ struct ClaudeCacheCreation {
 pub struct ArchiveResult {
     pub repo_url: String,
     pub cleaned_reports: usize,
+    pub uploaded_conversation_files: usize,
+    pub workflow_warning: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -227,22 +229,8 @@ pub fn write_report(sync: &HistorySyncSettings, token: Option<&str>) -> Result<P
         .unwrap_or_default()
         .as_secs();
     let path = reports_dir.join(format!("usage-history-{timestamp}.html"));
-    let html = if sync.prefer_remote_reports {
-        if let Some(token) = token {
-            if let Ok(remote_html) = fetch_remote_report_html(sync, token) {
-                Some(remote_html)
-            } else if let Ok(store) = fetch_remote_store(sync, token) {
-                Some(build_html_report(&summarize_store(&store), timestamp))
-            } else {
-                None
-            }
-        } else {
-            None
-        }
-    } else {
-        None
-    }
-    .unwrap_or_else(|| build_html_report(&read_snapshot(sync, token), timestamp));
+    let snapshot = build_report_snapshot(sync, token);
+    let html = build_html_report(&snapshot, timestamp);
 
     std::fs::write(&path, html)
         .map_err(|error| format!("Unable to write usage report: {error}"))?;
@@ -1065,13 +1053,14 @@ fn escape_html(value: &str) -> String {
 
 fn collect_snapshot(sync: &HistorySyncSettings, token: Option<&str>) -> HistorySnapshot {
     if sync.storage_mode == HistoryStorageMode::RemoteOnly {
+        let live_store = collect_live_store();
         if let Some(token) = token {
             if let Ok(store) = fetch_remote_store(sync, token) {
-                return summarize_store(&store);
+                return summarize_store(&merge_history_stores(store, live_store));
             }
         }
 
-        return summarize_store(&collect_live_store());
+        return summarize_store(&live_store);
     }
 
     summarize_store(&refresh_store_best_effort(sync))
@@ -1083,12 +1072,9 @@ pub fn archive_history(sync: &HistorySyncSettings, token: &str) -> Result<Archiv
         return Err("A GitHub token is required for archive upload.".to_string());
     }
 
-    if !sync.upload_history_store && !sync.upload_html_reports {
-        return Err("GitHub sync is configured to upload nothing. Enable at least one scope.".to_string());
-    }
-    if sync.upload_conversations {
+    if !sync.upload_history_store && !sync.upload_html_reports && !sync.upload_conversations {
         return Err(
-            "Conversation syncing remains intentionally disabled in this build. Keep that scope off and sync only usage aggregates or HTML reports."
+            "GitHub sync is configured to upload nothing. Enable at least one scope."
                 .to_string(),
         );
     }
@@ -1098,7 +1084,7 @@ pub fn archive_history(sync: &HistorySyncSettings, token: &str) -> Result<Archiv
     let store = refresh_store(sync)?;
     let snapshot = summarize_store(&store);
     let generated_at_unix = unix_now();
-    let agent = github_agent();
+    let agent = github_agent()?;
 
     if sync.upload_history_store {
         upload_github_file_with_agent(
@@ -1123,14 +1109,37 @@ pub fn archive_history(sync: &HistorySyncSettings, token: &str) -> Result<Archiv
             &format!("Update history report at {generated_at_unix}"),
         )?;
     }
-    if let Some(workflow_file) = sync.workflow_file.as_deref().filter(|value| !value.trim().is_empty()) {
-        trigger_report_workflow(&repo, token, sync.branch.as_deref(), workflow_file.trim())?;
-    }
+    let uploaded_conversation_files = if sync.upload_conversations {
+        archive_conversation_logs(
+            &agent,
+            &repo,
+            token,
+            sync.branch.as_deref(),
+            generated_at_unix,
+        )?
+    } else {
+        0
+    };
+    let workflow_warning = if let Some(workflow_file) = sync
+        .workflow_file
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        match trigger_report_workflow(&repo, token, sync.branch.as_deref(), workflow_file.trim()) {
+            Ok(()) => None,
+            Err(error) => Some(error),
+        }
+    } else {
+        None
+    };
 
     let cleaned_reports = cleanup_generated_reports(LOCAL_REPORTS_TO_KEEP_AFTER_ARCHIVE)?;
+    clear_cached_snapshot();
     Ok(ArchiveResult {
         repo_url,
         cleaned_reports,
+        uploaded_conversation_files,
+        workflow_warning,
     })
 }
 
@@ -1261,6 +1270,24 @@ fn collect_live_store() -> HistoryStore {
     let _ = merge_sessions(&mut store, scan_claude_sessions());
     let _ = merge_sessions(&mut store, scan_codex_sessions());
     store
+}
+
+fn build_report_snapshot(sync: &HistorySyncSettings, token: Option<&str>) -> HistorySnapshot {
+    if sync.prefer_remote_reports {
+        if let Some(token) = token {
+            if let Ok(remote_store) = fetch_remote_store(sync, token) {
+                let local_store = if sync.storage_mode == HistoryStorageMode::Local {
+                    refresh_store_best_effort(sync)
+                } else {
+                    collect_live_store()
+                };
+                return summarize_store(&merge_history_stores(remote_store, local_store));
+            }
+        }
+    }
+
+    clear_cached_snapshot();
+    read_snapshot(sync, token)
 }
 
 fn validate_local_repo_root(path: &Path) -> Result<PathBuf, String> {
@@ -1622,6 +1649,13 @@ fn summarize_store(store: &HistoryStore) -> HistorySnapshot {
     }
 }
 
+fn merge_history_stores(mut base: HistoryStore, incoming: HistoryStore) -> HistoryStore {
+    merge_sessions(&mut base, incoming.sessions);
+    base.version = HISTORY_STORE_VERSION;
+    base.updated_at_unix = base.updated_at_unix.max(incoming.updated_at_unix);
+    base
+}
+
 fn summarize_sessions<'a, I>(sessions: I) -> HistorySummary
 where
     I: IntoIterator<Item = &'a StoredSessionRecord>,
@@ -1735,9 +1769,8 @@ pub fn validate_github_token_format(token: &str) -> Result<(), String> {
 /// username on success.
 pub fn validate_github_token_live(token: &str) -> Result<String, String> {
     let token = token.trim();
-    let agent = ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(15))
-        .build();
+    let agent = github_agent_with_timeout(Duration::from_secs(15))
+        .map_err(|error| format!("Unable to validate token: {error}"))?;
     match agent
         .get("https://api.github.com/user")
         .set("Accept", "application/vnd.github+json")
@@ -1793,6 +1826,27 @@ struct GitHubRepoSpec {
     repo: String,
 }
 
+#[derive(Clone, Debug)]
+struct ConversationArchiveFile {
+    local_path: PathBuf,
+    remote_path: String,
+}
+
+#[derive(Serialize)]
+struct ConversationArchiveManifest {
+    version: u32,
+    generated_at_unix: u64,
+    files: Vec<ConversationArchiveManifestEntry>,
+}
+
+#[derive(Serialize)]
+struct ConversationArchiveManifestEntry {
+    provider: &'static str,
+    remote_path: String,
+    size_bytes: u64,
+    modified_at_unix: u64,
+}
+
 #[derive(Deserialize)]
 struct GitHubContentSha {
     sha: String,
@@ -1831,10 +1885,17 @@ fn parse_github_repo_spec(value: &str) -> Result<GitHubRepoSpec, String> {
     })
 }
 
-fn github_agent() -> ureq::Agent {
-    ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(30))
-        .build()
+fn github_agent() -> Result<ureq::Agent, String> {
+    github_agent_with_timeout(Duration::from_secs(30))
+}
+
+fn github_agent_with_timeout(timeout: Duration) -> Result<ureq::Agent, String> {
+    let tls = native_tls::TlsConnector::new()
+        .map_err(|error| format!("Unable to initialize TLS support for GitHub sync: {error}"))?;
+    Ok(ureq::AgentBuilder::new()
+        .timeout(timeout)
+        .tls_connector(std::sync::Arc::new(tls))
+        .build())
 }
 
 fn upload_github_file(
@@ -1845,7 +1906,7 @@ fn upload_github_file(
     content: &[u8],
     message: &str,
 ) -> Result<(), String> {
-    upload_github_file_with_agent(&github_agent(), repo, token, branch, path, content, message)
+    upload_github_file_with_agent(&github_agent()?, repo, token, branch, path, content, message)
 }
 
 fn upload_github_file_with_agent(
@@ -1909,29 +1970,13 @@ fn fetch_remote_store(sync: &HistorySyncSettings, token: &str) -> Result<History
     Ok(store)
 }
 
-fn fetch_remote_report_html(
-    sync: &HistorySyncSettings,
-    token: &str,
-) -> Result<String, String> {
-    let repo_url = effective_archive_repo_url(sync.repo_url.as_deref());
-    let repo = parse_github_repo_spec(&repo_url)?;
-    let bytes = download_github_file(
-        &repo,
-        token,
-        sync.branch.as_deref(),
-        "latest/history-report.html",
-    )?
-        .ok_or_else(|| "No GitHub HTML report was found in latest/history-report.html.".to_string())?;
-    String::from_utf8(bytes).map_err(|error| format!("GitHub HTML report is not valid UTF-8: {error}"))
-}
-
 fn download_github_file(
     repo: &GitHubRepoSpec,
     token: &str,
     branch: Option<&str>,
     path: &str,
 ) -> Result<Option<Vec<u8>>, String> {
-    let agent = github_agent();
+    let agent = github_agent()?;
     let url = github_contents_url(repo, path, branch);
     match agent
         .get(&url)
@@ -1997,7 +2042,7 @@ fn trigger_report_workflow(
     branch: Option<&str>,
     workflow_file: &str,
 ) -> Result<(), String> {
-    let agent = github_agent();
+    let agent = github_agent()?;
     let workflow_ref = if let Some(branch) = effective_archive_branch(branch) {
         branch
     } else {
@@ -2267,4 +2312,222 @@ fn history_store_path() -> Result<PathBuf, String> {
 
 fn reports_dir() -> Result<PathBuf, String> {
     Ok(app_data_dir()?.join("reports"))
+}
+
+fn archive_conversation_logs(
+    agent: &ureq::Agent,
+    repo: &GitHubRepoSpec,
+    token: &str,
+    branch: Option<&str>,
+    generated_at_unix: u64,
+) -> Result<usize, String> {
+    let files = collect_conversation_archive_files();
+    let mut manifest_files = Vec::with_capacity(files.len());
+
+    for file in &files {
+        let bytes = std::fs::read(&file.local_path).map_err(|error| {
+            format!(
+                "Unable to read conversation log {}: {error}",
+                file.local_path.display()
+            )
+        })?;
+        upload_github_file_with_agent(
+            agent,
+            repo,
+            token,
+            branch,
+            &file.remote_path,
+            &bytes,
+            &format!("Update conversation log {} at {generated_at_unix}", file.remote_path),
+        )?;
+
+        let metadata = std::fs::metadata(&file.local_path).map_err(|error| {
+            format!(
+                "Unable to read conversation log metadata {}: {error}",
+                file.local_path.display()
+            )
+        })?;
+        manifest_files.push(ConversationArchiveManifestEntry {
+            provider: conversation_provider_label(&file.remote_path),
+            remote_path: file.remote_path.clone(),
+            size_bytes: metadata.len(),
+            modified_at_unix: metadata
+                .modified()
+                .ok()
+                .and_then(system_time_to_unix)
+                .unwrap_or(0),
+        });
+    }
+
+    let manifest = ConversationArchiveManifest {
+        version: 1,
+        generated_at_unix,
+        files: manifest_files,
+    };
+    upload_github_file_with_agent(
+        agent,
+        repo,
+        token,
+        branch,
+        "latest/conversations/manifest.json",
+        &serde_json::to_vec_pretty(&manifest)
+            .map_err(|error| format!("Unable to serialize conversation manifest: {error}"))?,
+        &format!("Update conversation manifest at {generated_at_unix}"),
+    )?;
+
+    Ok(files.len())
+}
+
+fn collect_conversation_archive_files() -> Vec<ConversationArchiveFile> {
+    let Some(home) = dirs::home_dir() else {
+        return Vec::new();
+    };
+
+    let mut files = Vec::new();
+    push_conversation_archive_dir(
+        &mut files,
+        &home.join(".claude").join("projects"),
+        "latest/conversations/claude/projects",
+    );
+    push_conversation_archive_dir(
+        &mut files,
+        &home.join(".codex").join("sessions"),
+        "latest/conversations/codex/sessions",
+    );
+
+    let codex_history_path = home.join(".codex").join("history.jsonl");
+    if codex_history_path.is_file() {
+        files.push(ConversationArchiveFile {
+            local_path: codex_history_path,
+            remote_path: "latest/conversations/codex/history.jsonl".to_string(),
+        });
+    }
+
+    files.sort_by(|left, right| left.remote_path.cmp(&right.remote_path));
+    files
+}
+
+fn push_conversation_archive_dir(
+    output: &mut Vec<ConversationArchiveFile>,
+    root: &Path,
+    remote_prefix: &str,
+) {
+    let mut paths = Vec::new();
+    walk_files(root, &mut paths);
+
+    for path in paths.into_iter().filter(|path| is_jsonl_file(path)) {
+        let Ok(relative_path) = path.strip_prefix(root) else {
+            continue;
+        };
+        let remote_suffix = relative_path
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy().replace('\\', "-"))
+            .collect::<Vec<_>>()
+            .join("/");
+        if remote_suffix.is_empty() {
+            continue;
+        }
+        output.push(ConversationArchiveFile {
+            local_path: path,
+            remote_path: format!("{remote_prefix}/{remote_suffix}"),
+        });
+    }
+}
+
+fn conversation_provider_label(remote_path: &str) -> &'static str {
+    if remote_path.contains("/claude/") {
+        "claude"
+    } else {
+        "codex"
+    }
+}
+
+fn system_time_to_unix(value: SystemTime) -> Option<u64> {
+    value.duration_since(UNIX_EPOCH).ok().map(|duration| duration.as_secs())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn session(
+        provider: ProviderKind,
+        id: &str,
+        project_path: &str,
+        input_tokens: u64,
+        output_tokens: u64,
+        updated_at_unix: u64,
+    ) -> StoredSessionRecord {
+        StoredSessionRecord {
+            id: id.to_string(),
+            provider,
+            project_path: project_path.to_string(),
+            model_name: Some("gpt-5.4".to_string()),
+            input_tokens,
+            cached_input_tokens: 0,
+            output_tokens,
+            reasoning_output_tokens: 0,
+            estimated_cost_usd: input_tokens as f64 / 1000.0,
+            priced: true,
+            last_seen_unix: updated_at_unix,
+        }
+    }
+
+    #[test]
+    fn merge_history_stores_replaces_existing_sessions_and_keeps_new_ones() {
+        let remote = HistoryStore {
+            version: HISTORY_STORE_VERSION,
+            updated_at_unix: 10,
+            sessions: vec![session(
+                ProviderKind::Codex,
+                "session-a",
+                "C:\\repo",
+                100,
+                10,
+                10,
+            )],
+        };
+        let local = HistoryStore {
+            version: HISTORY_STORE_VERSION,
+            updated_at_unix: 20,
+            sessions: vec![
+                session(
+                    ProviderKind::Codex,
+                    "session-a",
+                    "C:\\repo",
+                    250,
+                    30,
+                    20,
+                ),
+                session(
+                    ProviderKind::Codex,
+                    "session-b",
+                    "C:\\repo",
+                    75,
+                    5,
+                    20,
+                ),
+            ],
+        };
+
+        let merged = merge_history_stores(remote, local);
+
+        assert_eq!(merged.updated_at_unix, 20);
+        assert_eq!(merged.sessions.len(), 2);
+        assert_eq!(merged.sessions[0].id, "session-a");
+        assert_eq!(merged.sessions[0].input_tokens, 250);
+        assert_eq!(merged.sessions[1].id, "session-b");
+    }
+
+    #[test]
+    fn conversation_provider_label_matches_archive_prefix() {
+        assert_eq!(
+            conversation_provider_label("latest/conversations/claude/projects/a.jsonl"),
+            "claude"
+        );
+        assert_eq!(
+            conversation_provider_label("latest/conversations/codex/sessions/a.jsonl"),
+            "codex"
+        );
+    }
 }
