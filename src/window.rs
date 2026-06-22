@@ -1,9 +1,7 @@
-use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
-use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, MutexGuard};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use windows::core::PCWSTR;
@@ -11,23 +9,23 @@ use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW};
 use windows::Win32::System::Registry::*;
-use windows::Win32::System::Threading::CreateMutexW;
+use windows::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
 use windows::Win32::UI::Accessibility::HWINEVENTHOOK;
 use windows::Win32::UI::HiDpi::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
+use windows::Win32::UI::Shell::ExtractIconExW;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::diagnose;
-use crate::history;
 use crate::localization::{self, LanguageId, Strings};
-use crate::models::{
-    ActivitySummary, HistoryStorageMode, HistorySyncSettings, ProviderKind, UsageData,
-};
+use crate::models::AppUsageData;
 use crate::native_interop::{
-    self, Color, TIMER_COUNTDOWN, TIMER_POLL, TIMER_RESET_POLL, WM_APP_USAGE_UPDATED,
+    self, Color, TIMER_COUNTDOWN, TIMER_POLL, TIMER_RESET_POLL, TIMER_UPDATE_CHECK, WM_APP_TRAY,
+    WM_APP_USAGE_UPDATED,
 };
-use crate::{codex_poller, poller, secret_store};
+use crate::poller;
 use crate::theme;
+use crate::tray_icon;
 use crate::updater::{self, InstallChannel, ReleaseDescriptor, UpdateCheckResult};
 
 /// Wrapper to make HWND sendable across threads (safe for PostMessage usage)
@@ -56,44 +54,43 @@ struct AppState {
     language_override: Option<LanguageId>,
     language: LanguageId,
     install_channel: InstallChannel,
-    active_provider: ProviderKind,
-    history_sync: HistorySyncSettings,
-    claude: ProviderState,
-    codex: ProviderState,
 
-    poll_interval_ms: u32,
-    retry_count: u32,
-    update_status: UpdateStatus,
-
-    tray_offset: i32,
-    dragging: bool,
-    drag_start_mouse_x: i32,
-    drag_start_offset: i32,
-}
-
-#[derive(Clone, Debug)]
-struct ProviderState {
-    data: Option<UsageData>,
-    activity: Option<ActivitySummary>,
     session_percent: f64,
     session_text: String,
     weekly_percent: f64,
     weekly_text: String,
-    last_poll_ok: bool,
-}
+    codex_session_percent: f64,
+    codex_session_text: String,
+    codex_weekly_percent: f64,
+    codex_weekly_text: String,
+    antigravity_session_percent: f64,
+    antigravity_session_text: String,
+    antigravity_weekly_percent: f64,
+    antigravity_weekly_text: String,
+    show_claude_code: bool,
+    show_codex: bool,
+    show_antigravity: bool,
 
-impl Default for ProviderState {
-    fn default() -> Self {
-        Self {
-            data: None,
-            activity: None,
-            session_percent: 0.0,
-            session_text: "--".to_string(),
-            weekly_percent: 0.0,
-            weekly_text: "--".to_string(),
-            last_poll_ok: false,
-        }
-    }
+    data: Option<AppUsageData>,
+
+    poll_interval_ms: u32,
+    retry_count: u32,
+    force_notify_auth_error: bool,
+    auth_error_paused_polling: bool,
+    auth_watch_mode: poller::CredentialWatchMode,
+    auth_watch_snapshot: poller::CredentialWatchSnapshot,
+    last_poll_ok: bool,
+    update_status: UpdateStatus,
+    last_update_check_unix: Option<u64>,
+
+    taskbar_index: usize,
+    tray_offset: i32,
+    dragging: bool,
+    drag_start_mouse_x: i32,
+    drag_start_client_x: i32,
+    drag_start_offset: i32,
+
+    widget_visible: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -120,36 +117,30 @@ const IDM_FREQ_1HOUR: u16 = 13;
 const IDM_START_WITH_WINDOWS: u16 = 20;
 const IDM_RESET_POSITION: u16 = 30;
 const IDM_VERSION_ACTION: u16 = 31;
-const IDM_PROVIDER_CLAUDE: u16 = 32;
-const IDM_PROVIDER_CODEX: u16 = 33;
 const IDM_LANG_SYSTEM: u16 = 40;
 const IDM_LANG_ENGLISH: u16 = 41;
-const IDM_LANG_SPANISH: u16 = 42;
-const IDM_LANG_FRENCH: u16 = 43;
-const IDM_LANG_GERMAN: u16 = 44;
-const IDM_LANG_JAPANESE: u16 = 45;
-const IDM_EXPORT_HISTORY_REPORT: u16 = 46;
-const IDM_ARCHIVE_HISTORY_GITHUB: u16 = 47;
-const IDM_SET_ARCHIVE_REPO: u16 = 48;
-const IDM_FETCH_HISTORY_GITHUB: u16 = 49;
-const IDM_SETUP_HISTORY_SYNC: u16 = 50;
-const IDM_INSTALL_WORKFLOW_GITHUB: u16 = 51;
-const IDM_INSTALL_WORKFLOW_LOCAL: u16 = 52;
-const IDM_OPEN_LOCAL_WORKFLOWS: u16 = 53;
-const IDM_OPEN_APP_DATA_FOLDER: u16 = 54;
-const IDM_OPEN_LOCAL_HISTORY_FOLDER: u16 = 55;
-const IDM_OPEN_REPORTS_FOLDER: u16 = 56;
-const IDM_OPEN_CLAUDE_SOURCE_FOLDER: u16 = 57;
-const IDM_OPEN_CODEX_SOURCE_FOLDER: u16 = 58;
-const IDM_SET_GITHUB_TOKEN: u16 = 59;
-const IDM_CLEAR_GITHUB_TOKEN: u16 = 60;
-const IDM_TOGGLE_CONVERSATION_SYNC: u16 = 61;
-const CREATE_NO_WINDOW: u32 = 0x08000000;
-
-const DIVIDER_HIT_ZONE: i32 = 13; // LEFT_DIVIDER_W + DIVIDER_RIGHT_MARGIN
+const IDM_LANG_DUTCH: u16 = 42;
+const IDM_LANG_SPANISH: u16 = 43;
+const IDM_LANG_FRENCH: u16 = 44;
+const IDM_LANG_GERMAN: u16 = 45;
+const IDM_LANG_JAPANESE: u16 = 46;
+const IDM_LANG_KOREAN: u16 = 47;
+const IDM_LANG_TRADITIONAL_CHINESE: u16 = 48;
+const IDM_LANG_RUSSIAN: u16 = 49;
+const IDM_LANG_PORTUGUESE_BRAZIL: u16 = 50;
+const IDM_MODEL_CLAUDE_CODE: u16 = 60;
+const IDM_MODEL_CODEX: u16 = 61;
+const IDM_MODEL_ANTIGRAVITY: u16 = 62;
 
 const WM_DPICHANGED_MSG: u32 = 0x02E0;
 const WM_APP_UPDATE_CHECK_COMPLETE: u32 = WM_APP + 2;
+const TRAY_ICON_UPDATE_REPOSITION_SUPPRESS_MS: u64 = 750;
+
+/// How often the watchdog thread polls for an explorer.exe restart (which
+/// recreates the taskbar and wipes our tray-icon registration).
+const TASKBAR_WATCH_INTERVAL_SECS: u64 = 2;
+
+static SUPPRESS_TRAY_REPOSITION_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
 
 /// Current system DPI (96 = 100% scaling, 144 = 150%, 192 = 200%, etc.)
 static CURRENT_DPI: AtomicU32 = AtomicU32::new(96);
@@ -176,6 +167,119 @@ fn refresh_dpi() {
     }
 }
 
+/// Spacing below which two relaunches are treated as a storm (e.g. explorer.exe
+/// crash-looping); when detected we back off instead of spawning in a tight loop.
+const RELAUNCH_THROTTLE_SECS: u64 = 10;
+const RELAUNCH_BACKOFF_SECS: u64 = 30;
+/// Environment flag set on a relaunched child so it waits for the previous
+/// instance's single-instance mutex instead of exiting immediately.
+const ENV_RELAUNCH: &str = "CCUM_RELAUNCH";
+/// Unix timestamp (seconds) of the relaunch that spawned this process, passed to
+/// the child so it can detect a relaunch storm.
+const ENV_LAST_RELAUNCH_UNIX: &str = "CCUM_LAST_RELAUNCH_UNIX";
+
+/// Relaunch the widget as a fresh process after explorer.exe has restarted.
+///
+/// When the shell restarts it destroys our embedded child window outright (the
+/// window is gone, not merely orphaned - `IsWindow` returns false) and leaves
+/// the UI thread parked in `GetMessage` with no window to recreate in place.
+/// Spawning a clean new process - which re-embeds into the freshly created
+/// taskbar - and exiting this one is the robust recovery. The child is flagged
+/// via `ENV_RELAUNCH` so it waits for this instance's single-instance mutex to
+/// be released before taking over (see the guard in `run`).
+fn relaunch_self() {
+    // Back off if we are relaunching very soon after the relaunch that spawned
+    // us: that signals the shell is crash-looping, not a one-off restart.
+    let now = now_unix_secs();
+    let last = std::env::var(ENV_LAST_RELAUNCH_UNIX)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+    if last != 0 && now.saturating_sub(last) < RELAUNCH_THROTTLE_SECS {
+        diagnose::log("relaunch storm detected; backing off before relaunching");
+        std::thread::sleep(Duration::from_secs(RELAUNCH_BACKOFF_SECS));
+    }
+
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(error) => {
+            diagnose::log_error("watchdog: unable to resolve current executable", error);
+            return;
+        }
+    };
+
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match std::process::Command::new(exe)
+        .args(&args)
+        .env(ENV_RELAUNCH, "1")
+        .env(ENV_LAST_RELAUNCH_UNIX, now.to_string())
+        .spawn()
+    {
+        Ok(_) => {
+            diagnose::log("watchdog: relaunched fresh instance, exiting old one");
+            std::process::exit(0);
+        }
+        Err(error) => {
+            diagnose::log_error("watchdog: unable to spawn relaunched instance", error);
+        }
+    }
+}
+
+/// Detect explorer.exe restarts and recover from them.
+///
+/// Once explorer destroys the taskbar, our embedded child window is destroyed
+/// and the UI message loop is dead, so recovery cannot happen in-process. This
+/// dedicated thread (independent of the dead message loop) polls the taskbar
+/// handle and, when it changes, relaunches the widget as a fresh process.
+fn spawn_taskbar_watchdog() {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(Duration::from_secs(TASKBAR_WATCH_INTERVAL_SECS));
+        let stored = {
+            let state = lock_state();
+            state.as_ref().and_then(|s| s.taskbar_hwnd)
+        };
+        // Only relevant once we have embedded into a taskbar at least once.
+        let Some(old) = stored else {
+            continue;
+        };
+        let taskbars = native_interop::find_taskbars();
+        if !taskbars.is_empty() && !taskbars.iter().any(|taskbar| taskbar.hwnd == old) {
+            let new = taskbars[0].hwnd;
+            diagnose::log(format!(
+                "watchdog: taskbar changed old={:?} new={:?} -> relaunching",
+                old.0, new.0
+            ));
+            relaunch_self();
+        }
+    });
+}
+
+fn load_embedded_app_icons() -> (HICON, HICON) {
+    unsafe {
+        let mut exe_buf = [0u16; 260];
+        let len = GetModuleFileNameW(None, &mut exe_buf) as usize;
+        if len == 0 {
+            return (HICON::default(), HICON::default());
+        }
+
+        let mut large_icon = HICON::default();
+        let mut small_icon = HICON::default();
+        let extracted = ExtractIconExW(
+            PCWSTR::from_raw(exe_buf.as_ptr()),
+            0,
+            Some(&mut large_icon),
+            Some(&mut small_icon),
+            1,
+        );
+
+        if extracted == 0 {
+            (HICON::default(), HICON::default())
+        } else {
+            (large_icon, small_icon)
+        }
+    }
+}
+
 unsafe impl Send for AppState {}
 
 static STATE: Mutex<Option<AppState>> = Mutex::new(None);
@@ -183,28 +287,6 @@ static STATE: Mutex<Option<AppState>> = Mutex::new(None);
 /// Lock STATE safely, recovering from poisoned mutex
 fn lock_state() -> MutexGuard<'static, Option<AppState>> {
     STATE.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-fn provider_state(state: &AppState, provider: ProviderKind) -> &ProviderState {
-    match provider {
-        ProviderKind::Claude => &state.claude,
-        ProviderKind::Codex => &state.codex,
-    }
-}
-
-fn provider_state_mut(state: &mut AppState, provider: ProviderKind) -> &mut ProviderState {
-    match provider {
-        ProviderKind::Claude => &mut state.claude,
-        ProviderKind::Codex => &mut state.codex,
-    }
-}
-
-fn active_provider_state(state: &AppState) -> &ProviderState {
-    provider_state(state, state.active_provider)
-}
-
-fn active_provider_state_mut(state: &mut AppState) -> &mut ProviderState {
-    provider_state_mut(state, state.active_provider)
 }
 
 fn settings_path() -> PathBuf {
@@ -218,24 +300,36 @@ fn settings_path() -> PathBuf {
 struct SettingsFile {
     #[serde(default)]
     tray_offset: i32,
+    #[serde(default)]
+    taskbar_index: usize,
     #[serde(default = "default_poll_interval")]
     poll_interval_ms: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     language: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    active_provider: Option<ProviderKind>,
-    #[serde(default)]
-    history_sync: HistorySyncSettings,
+    last_update_check_unix: Option<u64>,
+    #[serde(default = "default_widget_visible")]
+    widget_visible: bool,
+    #[serde(default = "default_show_claude_code")]
+    show_claude_code: bool,
+    #[serde(default = "default_show_codex")]
+    show_codex: bool,
+    #[serde(default = "default_show_antigravity")]
+    show_antigravity: bool,
 }
 
 impl Default for SettingsFile {
     fn default() -> Self {
         Self {
             tray_offset: 0,
+            taskbar_index: 0,
             poll_interval_ms: default_poll_interval(),
             language: None,
-            active_provider: None,
-            history_sync: HistorySyncSettings::default(),
+            last_update_check_unix: None,
+            widget_visible: true,
+            show_claude_code: true,
+            show_codex: false,
+            show_antigravity: false,
         }
     }
 }
@@ -244,12 +338,32 @@ fn default_poll_interval() -> u32 {
     POLL_15_MIN
 }
 
+fn default_widget_visible() -> bool {
+    true
+}
+
+fn default_show_claude_code() -> bool {
+    true
+}
+
+fn default_show_codex() -> bool {
+    false
+}
+
+fn default_show_antigravity() -> bool {
+    false
+}
+
 fn load_settings() -> SettingsFile {
     let content = match std::fs::read_to_string(settings_path()) {
         Ok(c) => c,
         Err(_) => return SettingsFile::default(),
     };
-    serde_json::from_str(&content).unwrap_or_default()
+    let mut settings: SettingsFile = serde_json::from_str(&content).unwrap_or_default();
+    if !settings.show_claude_code && !settings.show_codex && !settings.show_antigravity {
+        settings.show_claude_code = true;
+    }
+    settings
 }
 
 fn save_settings(settings: &SettingsFile) {
@@ -267,224 +381,296 @@ fn save_state_settings() {
     if let Some(s) = state.as_ref() {
         save_settings(&SettingsFile {
             tray_offset: s.tray_offset,
+            taskbar_index: s.taskbar_index,
             poll_interval_ms: s.poll_interval_ms,
             language: s
                 .language_override
                 .map(|language| language.code().to_string()),
-            active_provider: Some(s.active_provider),
-            history_sync: s.history_sync.clone(),
+            last_update_check_unix: s.last_update_check_unix,
+            widget_visible: s.widget_visible,
+            show_claude_code: s.show_claude_code,
+            show_codex: s.show_codex,
+            show_antigravity: s.show_antigravity,
         });
     }
 }
 
-fn refresh_provider_usage_texts(provider_state: &mut ProviderState, strings: Strings) {
-    if !provider_state.last_poll_ok {
-        return;
+fn tray_icon_data_from_state() -> Vec<tray_icon::TrayIconData> {
+    let state = lock_state();
+    match state.as_ref() {
+        Some(s) if s.last_poll_ok => {
+            let mut icons = Vec::new();
+            if s.show_claude_code {
+                icons.push(tray_icon::TrayIconData {
+                    kind: tray_icon::TrayIconKind::Claude,
+                    percent: Some(s.session_percent),
+                    tooltip: format!(
+                        "{} 5h: {} | 7d: {}",
+                        s.language.strings().claude_code_model,
+                        s.session_text,
+                        s.weekly_text
+                    ),
+                });
+            }
+            if s.show_codex {
+                icons.push(tray_icon::TrayIconData {
+                    kind: tray_icon::TrayIconKind::Codex,
+                    percent: Some(s.codex_session_percent),
+                    tooltip: format!(
+                        "{} 5h: {} | 7d: {}",
+                        s.language.strings().codex_model,
+                        s.codex_session_text,
+                        s.codex_weekly_text
+                    ),
+                });
+            }
+            if s.show_antigravity {
+                icons.push(tray_icon::TrayIconData {
+                    kind: tray_icon::TrayIconKind::Antigravity,
+                    percent: Some(s.antigravity_session_percent),
+                    tooltip: format!(
+                        "{} 5h: {} | 7d: {}",
+                        s.language.strings().antigravity_model,
+                        s.antigravity_session_text,
+                        s.antigravity_weekly_text
+                    ),
+                });
+            }
+            icons
+        }
+        Some(s) => {
+            let mut icons = Vec::new();
+            if s.show_claude_code {
+                icons.push(tray_icon::TrayIconData {
+                    kind: tray_icon::TrayIconKind::Claude,
+                    percent: None,
+                    tooltip: s.language.strings().window_title.to_string(),
+                });
+            }
+            if s.show_codex {
+                icons.push(tray_icon::TrayIconData {
+                    kind: tray_icon::TrayIconKind::Codex,
+                    percent: None,
+                    tooltip: s.language.strings().codex_window_title.to_string(),
+                });
+            }
+            if s.show_antigravity {
+                icons.push(tray_icon::TrayIconData {
+                    kind: tray_icon::TrayIconKind::Antigravity,
+                    percent: None,
+                    tooltip: s.language.strings().antigravity_window_title.to_string(),
+                });
+            }
+            icons
+        }
+        None => Vec::new(),
     }
+}
 
-    let Some(data) = provider_state.data.as_ref() else {
-        return;
+fn sync_tray_icons(hwnd: HWND) {
+    let icons = tray_icon_data_from_state();
+    tray_icon::sync(hwnd, &icons);
+}
+
+fn toggle_widget_visibility(hwnd: HWND) {
+    let new_visible = {
+        let mut state = lock_state();
+        if let Some(s) = state.as_mut() {
+            s.widget_visible = !s.widget_visible;
+            s.widget_visible
+        } else {
+            return;
+        }
     };
-
-    provider_state.session_text = poller::format_line(&data.session, strings);
-    provider_state.weekly_text = poller::format_line(&data.weekly, strings);
-}
-
-fn refresh_usage_texts(state: &mut AppState) {
-    let strings = state.language.strings();
-    refresh_provider_usage_texts(&mut state.claude, strings);
-    refresh_provider_usage_texts(&mut state.codex, strings);
-}
-
-fn set_provider_data(
-    state: &mut AppState,
-    provider: ProviderKind,
-    data: UsageData,
-    activity: Option<ActivitySummary>,
-) {
-    let provider_state = provider_state_mut(state, provider);
-    provider_state.session_percent = data.session.percentage;
-    provider_state.weekly_percent = data.weekly.percentage;
-    provider_state.data = Some(data);
-    provider_state.activity = activity;
-    provider_state.last_poll_ok = true;
-}
-
-fn set_provider_loading(state: &mut AppState, provider: ProviderKind) {
-    let provider_state = provider_state_mut(state, provider);
-    provider_state.session_text = "...".to_string();
-    provider_state.weekly_text = "...".to_string();
-    provider_state.last_poll_ok = false;
-}
-
-fn set_provider_unavailable(state: &mut AppState, provider: ProviderKind) {
-    let provider_state = provider_state_mut(state, provider);
-    provider_state.session_text = "--".to_string();
-    provider_state.weekly_text = "--".to_string();
-    provider_state.last_poll_ok = false;
-}
-
-fn auto_select_active_provider(state: &mut AppState) {
-    if active_provider_state(state).last_poll_ok {
-        return;
-    }
-
-    for provider in ProviderKind::ALL {
-        if provider == state.active_provider {
-            continue;
-        }
-
-        if provider_state(state, provider).last_poll_ok {
-            state.active_provider = provider;
-            break;
+    save_state_settings();
+    unsafe {
+        if new_visible {
+            position_at_taskbar();
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            render_layered();
+        } else {
+            let _ = ShowWindow(hwnd, SW_HIDE);
         }
     }
 }
 
-fn provider_is_selectable(provider_state: &ProviderState) -> bool {
-    provider_state.last_poll_ok || provider_state.data.is_some() || provider_state.activity.is_some()
-}
-
-fn cycle_active_provider(state: &mut AppState) -> bool {
-    let selectable: Vec<ProviderKind> = ProviderKind::ALL
-        .into_iter()
-        .filter(|provider| provider_is_selectable(provider_state(state, *provider)))
-        .collect();
-
-    if selectable.len() <= 1 {
+fn attach_to_taskbar(hwnd: HWND, requested_index: usize) -> bool {
+    let taskbars = native_interop::find_taskbars();
+    if taskbars.is_empty() {
+        diagnose::log("taskbar not found; using fallback popup window");
         return false;
     }
 
-    let current_index = selectable
-        .iter()
-        .position(|provider| *provider == state.active_provider)
-        .unwrap_or(0);
-    let next_index = (current_index + 1) % selectable.len();
-    state.active_provider = selectable[next_index];
+    let index = requested_index.min(taskbars.len().saturating_sub(1));
+    let taskbar = taskbars[index];
+    diagnose::log(format!(
+        "taskbar selected index={index} count={} hwnd={:?} rect=({}, {}, {}, {})",
+        taskbars.len(),
+        taskbar.hwnd,
+        taskbar.rect.left,
+        taskbar.rect.top,
+        taskbar.rect.right,
+        taskbar.rect.bottom
+    ));
+
+    let old_hook = {
+        let mut state = lock_state();
+        state.as_mut().and_then(|s| s.win_event_hook.take())
+    };
+    if let Some(hook) = old_hook {
+        native_interop::unhook_win_event(hook);
+    }
+
+    native_interop::embed_in_taskbar(hwnd, taskbar.hwnd);
+
+    let tray_notify = native_interop::find_child_window(taskbar.hwnd, "TrayNotifyWnd");
+    if tray_notify.is_some() {
+        diagnose::log("TrayNotifyWnd found");
+    } else {
+        diagnose::log("TrayNotifyWnd not found");
+    }
+
+    let hook = tray_notify.and_then(|tray_hwnd| {
+        let thread_id = native_interop::get_window_thread_id(tray_hwnd);
+        native_interop::set_tray_event_hook(thread_id, on_tray_location_changed)
+    });
+    if hook.is_some() {
+        diagnose::log("tray event hook installed");
+    } else {
+        diagnose::log("tray event hook could not be installed");
+    }
+
+    let mut state = lock_state();
+    if let Some(s) = state.as_mut() {
+        s.taskbar_hwnd = Some(taskbar.hwnd);
+        s.tray_notify_hwnd = tray_notify;
+        s.win_event_hook = hook;
+        s.taskbar_index = index;
+        s.embedded = true;
+    }
     true
 }
 
-fn provider_name(provider: ProviderKind) -> &'static str {
-    match provider {
-        ProviderKind::Claude => "Claude",
-        ProviderKind::Codex => "Codex",
-    }
+fn taskbar_at_point(pt: POINT) -> Option<(usize, native_interop::TaskbarWindow)> {
+    native_interop::find_taskbars()
+        .into_iter()
+        .enumerate()
+        .find(|(_, taskbar)| {
+            pt.x >= taskbar.rect.left
+                && pt.x < taskbar.rect.right
+                && pt.y >= taskbar.rect.top
+                && pt.y < taskbar.rect.bottom
+        })
 }
 
-fn provider_summary_line(provider: ProviderKind, provider_state: &ProviderState) -> String {
-    format!(
-        "{}: 5h {} | 7d {}",
-        provider_name(provider),
-        provider_state.session_text,
-        provider_state.weekly_text
-    )
+fn tray_left_for_taskbar(taskbar_hwnd: HWND, taskbar_rect: RECT) -> i32 {
+    let mut tray_left = taskbar_rect.right;
+    if let Some(tray_hwnd) = native_interop::find_child_window(taskbar_hwnd, "TrayNotifyWnd") {
+        if let Some(tray_rect) = native_interop::get_window_rect_safe(tray_hwnd) {
+            tray_left = tray_rect.left;
+        }
+    }
+    tray_left
 }
 
-fn provider_raw_usage_line(provider: ProviderKind, data: &UsageData) -> String {
-    let s_used = data.session.percentage.clamp(0.0, 100.0);
-    let s_remaining = (100.0 - s_used).max(0.0);
-    let w_used = data.weekly.percentage.clamp(0.0, 100.0);
-    let w_remaining = (100.0 - w_used).max(0.0);
-
-    format!(
-        "{} raw: 5h used {:.0}% rem {:.0}% | 7d used {:.0}% rem {:.0}%",
-        provider_name(provider),
-        s_used,
-        s_remaining,
-        w_used,
-        w_remaining
-    )
+fn clamp_offset_for_taskbar(taskbar_hwnd: HWND, taskbar_rect: RECT, offset: i32) -> i32 {
+    let tray_left = tray_left_for_taskbar(taskbar_hwnd, taskbar_rect);
+    let max_offset = (tray_left - taskbar_rect.left - total_widget_width()).max(0);
+    offset.clamp(0, max_offset)
 }
 
-fn credits_text(data: &UsageData) -> Option<String> {
-    if data.unlimited_credits {
-        return Some("Credits: unlimited".to_string());
-    }
-
-    if data.has_credits || data.credits_remaining.unwrap_or(0.0) > 0.0 {
-        return Some(format!(
-            "Credits: {:.0}",
-            data.credits_remaining.unwrap_or_default()
-        ));
-    }
-
-    None
+fn offset_for_drop_point(
+    taskbar_hwnd: HWND,
+    taskbar_rect: RECT,
+    pt: POINT,
+    drag_start_client_x: i32,
+) -> i32 {
+    let tray_left = tray_left_for_taskbar(taskbar_hwnd, taskbar_rect);
+    let desired_left = pt.x - taskbar_rect.left - drag_start_client_x;
+    let offset = tray_left - taskbar_rect.left - total_widget_width() - desired_left;
+    clamp_offset_for_taskbar(taskbar_hwnd, taskbar_rect, offset)
 }
 
-fn activity_lines(activity: &ActivitySummary) -> Vec<String> {
-    let mut lines = vec![
-        format!(
-            "Prompts: {} today | {} / 7d",
-            activity.prompts_last_24h, activity.prompts_last_7d
-        ),
-        format!(
-            "Sessions: {} today | {} / 7d",
-            activity.sessions_last_24h, activity.sessions_last_7d
-        ),
-    ];
-
-    if let Some(last_prompt) = activity.last_prompt.as_deref().filter(|value| !value.is_empty()) {
-        let suffix = activity
-            .last_prompt_at
-            .map(relative_time_text)
-            .map(|text| format!(" ({text})"))
-            .unwrap_or_default();
-        lines.push(format!(
-            "Last prompt: {}{}",
-            trim_for_menu(last_prompt, 60),
-            suffix
-        ));
-    }
-
-    lines
-}
-
-fn trim_for_menu(value: &str, max_chars: usize) -> String {
-    let normalized = value
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .trim()
-        .to_string();
-
-    if normalized.chars().count() <= max_chars {
-        return normalized;
-    }
-
-    let mut trimmed = String::new();
-    for ch in normalized.chars().take(max_chars.saturating_sub(1)) {
-        trimmed.push(ch);
-    }
-    trimmed.push('…');
-    trimmed
-}
-
-fn relative_time_text(timestamp: SystemTime) -> String {
-    let elapsed = SystemTime::now()
-        .duration_since(timestamp)
+fn now_unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_secs();
+        .as_secs()
+}
 
-    if elapsed < 60 {
-        "just now".to_string()
-    } else if elapsed < 3_600 {
-        format!("{}m ago", elapsed / 60)
-    } else if elapsed < 86_400 {
-        format!("{}h ago", elapsed / 3_600)
-    } else {
-        format!("{}d ago", elapsed / 86_400)
+fn update_check_interval() -> Duration {
+    Duration::from_secs(24 * 60 * 60)
+}
+
+fn auto_update_check_due(last_update_check_unix: Option<u64>) -> bool {
+    let Some(last_update_check_unix) = last_update_check_unix else {
+        return true;
+    };
+
+    now_unix_secs().saturating_sub(last_update_check_unix) >= update_check_interval().as_secs()
+}
+
+fn schedule_auto_update_check(hwnd: HWND) {
+    let delay_ms = {
+        let state = lock_state();
+        let Some(s) = state.as_ref() else {
+            return;
+        };
+
+        if auto_update_check_due(s.last_update_check_unix) {
+            None
+        } else {
+            let elapsed = now_unix_secs().saturating_sub(s.last_update_check_unix.unwrap_or(0));
+            let remaining_secs = update_check_interval().as_secs().saturating_sub(elapsed);
+            Some((remaining_secs.saturating_mul(1000)).min(u32::MAX as u64) as u32)
+        }
+    };
+
+    unsafe {
+        let _ = KillTimer(hwnd, TIMER_UPDATE_CHECK);
+        if let Some(delay_ms) = delay_ms {
+            SetTimer(hwnd, TIMER_UPDATE_CHECK, delay_ms.max(1), None);
+        }
     }
 }
 
-fn append_disabled_menu_line(menu: HMENU, text: &str) {
-    unsafe {
-        let label = native_interop::wide_str(text);
-        let _ = AppendMenuW(
-            menu,
-            MF_GRAYED,
-            0,
-            PCWSTR::from_raw(label.as_ptr()),
-        );
+fn refresh_usage_texts(state: &mut AppState) {
+    if !state.last_poll_ok {
+        return;
+    }
+
+    let strings = state.language.strings();
+    let Some(data) = state.data.as_ref() else {
+        return;
+    };
+
+    if let Some(claude_code) = data.claude_code.as_ref() {
+        state.session_text = poller::format_line(&claude_code.session, strings);
+        state.weekly_text = poller::format_line(&claude_code.weekly, strings);
+    } else if state.show_claude_code {
+        state.session_text = "!".to_string();
+        state.weekly_text = "!".to_string();
+    }
+
+    if let Some(codex) = data.codex.as_ref() {
+        state.codex_session_text = poller::format_line(&codex.session, strings);
+        state.codex_weekly_text = poller::format_line(&codex.weekly, strings);
+    } else if state.show_codex {
+        state.codex_session_text = "!".to_string();
+        state.codex_weekly_text = "!".to_string();
+    }
+
+    if let Some(antigravity) = data.antigravity.as_ref() {
+        state.antigravity_session_text = poller::format_line(&antigravity.session, strings);
+        state.antigravity_weekly_text =
+            if antigravity.weekly.resets_at.is_none() && antigravity.weekly.percentage == 0.0 {
+                "--".to_string()
+            } else {
+                poller::format_line(&antigravity.weekly, strings)
+            };
+    } else if state.show_antigravity {
+        state.antigravity_session_text = "!".to_string();
+        state.antigravity_weekly_text = "!".to_string();
     }
 }
 
@@ -518,361 +704,6 @@ fn show_error_message(hwnd: HWND, title: &str, message: &str) {
             PCWSTR::from_raw(title_wide.as_ptr()),
             MB_OK | MB_ICONERROR,
         );
-    }
-}
-
-fn ask_yes_no(hwnd: HWND, title: &str, message: &str) -> bool {
-    unsafe {
-        let title_wide = native_interop::wide_str(title);
-        let message_wide = native_interop::wide_str(message);
-        MessageBoxW(
-            hwnd,
-            PCWSTR::from_raw(message_wide.as_ptr()),
-            PCWSTR::from_raw(title_wide.as_ptr()),
-            MB_YESNO | MB_ICONQUESTION,
-        ) == IDYES
-    }
-}
-
-fn prompt_for_text(title: &str, prompt: &str, default_value: &str) -> Option<String> {
-    let script = format!(
-        r#"
-Add-Type -AssemblyName System.Windows.Forms
-Add-Type -AssemblyName System.Drawing
-
-$form = New-Object Windows.Forms.Form
-$form.Text = '{title}'
-$form.StartPosition = 'CenterScreen'
-$form.Size = New-Object Drawing.Size(700, 175)
-$form.TopMost = $true
-$form.FormBorderStyle = [Windows.Forms.FormBorderStyle]::FixedDialog
-$form.MaximizeBox = $false
-$form.MinimizeBox = $false
-
-$label = New-Object Windows.Forms.Label
-$label.Text = '{prompt}'
-$label.Location = New-Object Drawing.Point(14, 14)
-$label.Size = New-Object Drawing.Size(656, 36)
-$form.Controls.Add($label)
-
-$textbox = New-Object Windows.Forms.TextBox
-$textbox.Location = New-Object Drawing.Point(14, 58)
-$textbox.Size = New-Object Drawing.Size(656, 26)
-$textbox.Text = '{default_value}'
-$form.Controls.Add($textbox)
-
-$ok = New-Object Windows.Forms.Button
-$ok.Text = 'OK'
-$ok.Location = New-Object Drawing.Point(514, 100)
-$ok.Size = New-Object Drawing.Size(75, 28)
-$ok.DialogResult = [Windows.Forms.DialogResult]::OK
-$form.Controls.Add($ok)
-
-$cancel = New-Object Windows.Forms.Button
-$cancel.Text = 'Cancel'
-$cancel.Location = New-Object Drawing.Point(595, 100)
-$cancel.Size = New-Object Drawing.Size(75, 28)
-$cancel.DialogResult = [Windows.Forms.DialogResult]::Cancel
-$form.Controls.Add($cancel)
-
-$form.AcceptButton = $ok
-$form.CancelButton = $cancel
-
-if ($form.ShowDialog() -eq [Windows.Forms.DialogResult]::OK) {{
-    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-    Write-Output $textbox.Text
-    exit 0
-}}
-
-exit 1
-"#,
-        title = powershell_literal(title),
-        prompt = powershell_literal(prompt),
-        default_value = powershell_literal(default_value),
-    );
-
-    let output = Command::new("powershell.exe")
-        .arg("-NoProfile")
-        .arg("-Command")
-        .arg(script)
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .ok()?;
-
-    if !output.status.success() {
-        return None;
-    }
-
-    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
-
-fn powershell_literal(value: &str) -> String {
-    value.replace('\'', "''")
-}
-
-fn effective_archive_repo_url(repo_override: Option<&str>) -> String {
-    history::effective_archive_repo_url(repo_override)
-}
-
-fn archive_repo_line(sync: &HistorySyncSettings) -> String {
-    let effective = effective_archive_repo_url(sync.repo_url.as_deref());
-    if sync
-        .repo_url
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .is_some()
-    {
-        format!("Archive repo: {}", trim_for_menu(&effective, 58))
-    } else {
-        format!("Archive repo: default {}", trim_for_menu(&effective, 49))
-    }
-}
-
-fn archive_branch_line(sync: &HistorySyncSettings) -> String {
-    match sync
-        .branch
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        Some(branch) => format!("Archive branch: {}", trim_for_menu(branch, 54)),
-        None => "Archive branch: default".to_string(),
-    }
-}
-
-fn local_repo_line(sync: &HistorySyncSettings) -> String {
-    match sync
-        .local_repo_path
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        Some(path) => format!("Local repo: {}", trim_for_menu(path, 56)),
-        None => "Local repo: not set".to_string(),
-    }
-}
-
-fn github_token_line() -> String {
-    if archive_token_from_env().is_some() {
-        "PAT: env".to_string()
-    } else if secret_store::has_github_pat() {
-        "PAT: saved securely".to_string()
-    } else {
-        "PAT: not set".to_string()
-    }
-}
-
-fn archive_token_from_env() -> Option<String> {
-    ["CCUM_GITHUB_TOKEN", "GITHUB_TOKEN"]
-        .into_iter()
-        .find_map(|name| std::env::var(name).ok())
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-}
-
-fn archive_token_from_sources() -> Option<String> {
-    archive_token_from_env().or_else(secret_store::load_github_pat)
-}
-
-fn effective_local_repo_path(sync: &HistorySyncSettings) -> Option<String> {
-    sync.local_repo_path
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-}
-
-fn prompt_local_repo_path(current: Option<&str>) -> Option<String> {
-    let default_path = current.unwrap_or("");
-    prompt_for_text(
-        "Local Workflow Repo",
-        "Local git repository path where the sample workflow should be installed or opened. No administrator access is required; the folder just needs to be writable.",
-        default_path,
-    )
-    .map(|value| value.trim().to_string())
-    .filter(|value| !value.is_empty())
-}
-
-fn open_in_explorer(path: &std::path::Path) -> Result<(), String> {
-    Command::new("explorer.exe")
-        .arg(path)
-        .spawn()
-        .map_err(|error| format!("Unable to open {} in Explorer: {error}", path.display()))?;
-    Ok(())
-}
-
-fn app_data_folder_path() -> PathBuf {
-    settings_path()
-        .parent()
-        .map(std::path::Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."))
-}
-
-fn local_history_folder_path() -> PathBuf {
-    app_data_folder_path().join("history")
-}
-
-fn reports_folder_path() -> PathBuf {
-    app_data_folder_path().join("reports")
-}
-
-fn claude_source_folder_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|home| home.join(".claude").join("projects"))
-}
-
-fn codex_source_folder_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|home| home.join(".codex").join("sessions"))
-}
-
-fn open_or_create_folder(path: &std::path::Path) -> Result<(), String> {
-    std::fs::create_dir_all(path)
-        .map_err(|error| format!("Unable to create {}: {error}", path.display()))?;
-    open_in_explorer(path)
-}
-
-fn open_existing_folder(path: &std::path::Path) -> Result<(), String> {
-    if !path.exists() {
-        return Err(format!("Folder does not exist: {}", path.display()));
-    }
-    open_in_explorer(path)
-}
-
-fn resolve_local_repo_path(current_sync: &HistorySyncSettings) -> Option<String> {
-    effective_local_repo_path(current_sync)
-        .or_else(|| prompt_local_repo_path(current_sync.local_repo_path.as_deref()))
-}
-
-fn run_sync_setup(hwnd: HWND, current: &HistorySyncSettings) -> Option<HistorySyncSettings> {
-    let repo_default = current
-        .repo_url
-        .clone()
-        .unwrap_or_else(|| history::DEFAULT_ARCHIVE_REPO_URL.to_string());
-    let repo_value = prompt_for_text(
-        "GitHub Sync Setup",
-        "GitHub repo in owner/repo, https://github.com/owner/repo.git, or git@github.com:owner/repo.git form. Leave blank to use the default archive repo.",
-        &repo_default,
-    )?;
-    let repo_url = if repo_value.trim().is_empty()
-        || repo_value
-            .trim()
-            .eq_ignore_ascii_case(history::DEFAULT_ARCHIVE_REPO_URL)
-    {
-        None
-    } else {
-        Some(repo_value.trim().to_string())
-    };
-    let branch_value = prompt_for_text(
-        "GitHub Sync Setup",
-        "Branch to sync against. Leave blank to use the repository default branch.",
-        current.branch.as_deref().unwrap_or(""),
-    )?;
-    let branch = {
-        let trimmed = branch_value.trim();
-        (!trimmed.is_empty()).then(|| trimmed.to_string())
-    };
-    let local_repo_path = prompt_local_repo_path(current.local_repo_path.as_deref());
-
-    let use_remote_only = ask_yes_no(
-        hwnd,
-        "GitHub Sync Setup",
-        "Use GitHub as the primary history store? Yes keeps only source logs locally and avoids persisting the app's own history database on disk.",
-    );
-    let upload_history_store = ask_yes_no(
-        hwnd,
-        "GitHub Sync Setup",
-        "Upload the compact history store to GitHub? Recommended: Yes.",
-    );
-    let upload_html_reports = ask_yes_no(
-        hwnd,
-        "GitHub Sync Setup",
-        "Upload generated HTML usage reports to GitHub? Recommended: Yes if you want a browser-ready snapshot.",
-    );
-    let prefer_remote_reports = ask_yes_no(
-        hwnd,
-        "GitHub Sync Setup",
-        "When exporting reports, prefer the GitHub copy first? Choose No to always generate reports locally.",
-    );
-    let wants_conversation_sync = ask_yes_no(
-        hwnd,
-        "GitHub Sync Setup",
-        "Allow raw conversation/session log syncing? Recommended: No. This is privacy-heavy and not lightweight.",
-    );
-    if wants_conversation_sync {
-        show_info_message(
-            hwnd,
-            "GitHub Sync Setup",
-            "Raw conversation syncing is enabled for this configuration. It will upload .claude and .codex session logs to GitHub and may be slower on large histories.",
-        );
-    }
-    let workflow_prompt = if ask_yes_no(
-        hwnd,
-        "GitHub Sync Setup",
-        "Trigger a GitHub Actions workflow after sync to build reports on GitHub? This requires a workflow file in the target repo and Actions/Workflows permission.",
-    ) {
-        prompt_for_text(
-            "Workflow File",
-            "Workflow file name to dispatch, for example build-history-report.yml. Leave blank to skip remote workflow dispatch.",
-            current
-                .workflow_file
-                .as_deref()
-                .unwrap_or(history::DEFAULT_WORKFLOW_FILE_NAME),
-        )
-    } else {
-        Some(String::new())
-    }?;
-
-    Some(HistorySyncSettings {
-        repo_url,
-        branch,
-        local_repo_path,
-        upload_history_store,
-        upload_html_reports,
-        upload_conversations: wants_conversation_sync,
-        prefer_remote_reports,
-        workflow_file: {
-            let trimmed = workflow_prompt.trim();
-            (!trimmed.is_empty()).then(|| trimmed.to_string())
-        },
-        storage_mode: if use_remote_only {
-            HistoryStorageMode::RemoteOnly
-        } else {
-            HistoryStorageMode::Local
-        },
-    })
-}
-
-fn sync_mode_line(sync: &HistorySyncSettings) -> String {
-    let mode = match sync.storage_mode {
-        HistoryStorageMode::Local => "Local store + GitHub sync",
-        HistoryStorageMode::RemoteOnly => "Remote-first, no local app store",
-    };
-    format!("Sync mode: {mode}")
-}
-
-fn sync_scopes_line(sync: &HistorySyncSettings) -> String {
-    let mut scopes = Vec::new();
-    if sync.upload_history_store {
-        scopes.push("history store");
-    }
-    if sync.upload_html_reports {
-        scopes.push("html reports");
-    }
-    if sync.upload_conversations {
-        scopes.push("conversations");
-    }
-    if scopes.is_empty() {
-        "GitHub scopes: none".to_string()
-    } else {
-        format!("GitHub scopes: {}", scopes.join(", "))
-    }
-}
-
-fn sync_report_source_line(sync: &HistorySyncSettings) -> String {
-    if sync.prefer_remote_reports {
-        "Reports: prefer GitHub copy".to_string()
-    } else {
-        "Reports: generate locally".to_string()
     }
 }
 
@@ -926,27 +757,30 @@ fn version_action_label(
     status: &UpdateStatus,
 ) -> String {
     let current = env!("CARGO_PKG_VERSION");
-    if install_channel == InstallChannel::Winget {
-        return format!("v{current} - {}", localization::update_via_winget(language));
-    }
-
     match status {
         UpdateStatus::Idle => format!("v{current} - {}", strings.check_for_updates),
         UpdateStatus::Checking => format!("v{current} - {}", strings.checking_for_updates),
         UpdateStatus::Applying => format!("v{current} - {}", strings.applying_update),
         UpdateStatus::UpToDate => format!("v{current} - {}", strings.up_to_date_short),
-        UpdateStatus::Available(release) => {
-            format!(
+        UpdateStatus::Available(release) => match install_channel {
+            InstallChannel::Portable => {
+                format!(
+                    "v{current} - {} v{}",
+                    strings.update_to, release.latest_version
+                )
+            }
+            InstallChannel::Winget => format!(
                 "v{current} - {} v{}",
-                strings.update_to, release.latest_version
-            )
-        }
+                localization::update_via_winget(language),
+                release.latest_version
+            ),
+        },
     }
 }
 
-fn begin_update_check(hwnd: HWND) {
+fn begin_update_check(hwnd: HWND, interactive: bool) {
     let send_hwnd = SendHwnd::from_hwnd(hwnd);
-    let strings = {
+    let (strings, install_channel) = {
         let mut state = lock_state();
         let Some(app_state) = state.as_mut() else {
             return;
@@ -956,29 +790,36 @@ fn begin_update_check(hwnd: HWND) {
             app_state.update_status,
             UpdateStatus::Checking | UpdateStatus::Applying
         ) {
-            show_info_message(
-                hwnd,
-                app_state.language.strings().updates,
-                app_state.language.strings().update_in_progress,
-            );
+            if interactive {
+                show_info_message(
+                    hwnd,
+                    app_state.language.strings().updates,
+                    app_state.language.strings().update_in_progress,
+                );
+            }
             return;
         }
 
         app_state.update_status = UpdateStatus::Checking;
-        app_state.language.strings()
+        (app_state.language.strings(), app_state.install_channel)
     };
 
     std::thread::spawn(move || {
         let hwnd = send_hwnd.to_hwnd();
+        let checked_at = now_unix_secs();
         match updater::check_for_updates() {
             Ok(UpdateCheckResult::UpToDate) => {
                 {
                     let mut state = lock_state();
                     if let Some(s) = state.as_mut() {
                         s.update_status = UpdateStatus::UpToDate;
+                        s.last_update_check_unix = Some(checked_at);
                     }
                 }
-                show_info_message(hwnd, strings.updates, strings.up_to_date);
+                save_state_settings();
+                if interactive {
+                    show_info_message(hwnd, strings.updates, strings.up_to_date);
+                }
                 unsafe {
                     let _ = PostMessageW(hwnd, WM_APP_UPDATE_CHECK_COMPLETE, WPARAM(0), LPARAM(0));
                 }
@@ -988,10 +829,15 @@ fn begin_update_check(hwnd: HWND) {
                     let mut state = lock_state();
                     if let Some(s) = state.as_mut() {
                         s.update_status = UpdateStatus::Available(release.clone());
+                        s.last_update_check_unix = Some(checked_at);
                     }
                 }
-                if show_update_prompt(hwnd, strings, &release) {
-                    begin_update_apply(hwnd, release);
+                save_state_settings();
+                if interactive && show_update_prompt(hwnd, strings, &release) {
+                    match install_channel {
+                        InstallChannel::Portable => begin_update_apply(hwnd, release),
+                        InstallChannel::Winget => begin_winget_update(hwnd),
+                    }
                 }
                 unsafe {
                     let _ = PostMessageW(hwnd, WM_APP_UPDATE_CHECK_COMPLETE, WPARAM(0), LPARAM(0));
@@ -1002,10 +848,14 @@ fn begin_update_check(hwnd: HWND) {
                     let mut state = lock_state();
                     if let Some(s) = state.as_mut() {
                         s.update_status = UpdateStatus::Idle;
+                        s.last_update_check_unix = Some(checked_at);
                     }
                 }
-                let message = format!("{}.\n\n{}", strings.update_failed, error);
-                show_error_message(hwnd, strings.updates, &message);
+                save_state_settings();
+                if interactive {
+                    let message = format!("{}.\n\n{}", strings.update_failed, error);
+                    show_error_message(hwnd, strings.updates, &message);
+                }
                 unsafe {
                     let _ = PostMessageW(hwnd, WM_APP_UPDATE_CHECK_COMPLETE, WPARAM(0), LPARAM(0));
                 }
@@ -1068,9 +918,14 @@ fn begin_winget_update(hwnd: HWND) {
     }
     .unwrap_or(LanguageId::English.strings());
 
-    if let Err(error) = updater::begin_winget_update() {
-        let message = format!("{}.\n\n{}", strings.update_failed, error);
-        show_error_message(hwnd, strings.updates, &message);
+    match updater::begin_winget_update() {
+        Ok(()) => unsafe {
+            let _ = PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
+        },
+        Err(error) => {
+            let message = format!("{}.\n\n{}", strings.update_failed, error);
+            show_error_message(hwnd, strings.updates, &message);
+        }
     }
 }
 
@@ -1139,11 +994,9 @@ fn is_startup_enabled() -> bool {
             return false;
         }
         let current_exe = String::from_utf16_lossy(&exe_buf[..len]);
-        let expected_command = startup_command_for_executable(&current_exe);
 
         // Case-insensitive comparison (Windows paths are case-insensitive)
         reg_value.eq_ignore_ascii_case(&current_exe)
-            || reg_value.eq_ignore_ascii_case(&expected_command)
     }
 }
 
@@ -1169,17 +1022,15 @@ fn set_startup_enabled(enable: bool) {
             let mut exe_buf = [0u16; 260];
             let len = GetModuleFileNameW(None, &mut exe_buf) as usize;
             if len > 0 {
-                let current_exe = String::from_utf16_lossy(&exe_buf[..len]);
-                let startup_value = startup_command_for_executable(&current_exe);
-                let startup_wide = native_interop::wide_str(&startup_value);
-                let byte_len = (startup_wide.len() * 2) as u32;
+                // Write the wide string including null terminator
+                let byte_len = ((len + 1) * 2) as u32;
                 let _ = RegSetValueExW(
                     hkey,
                     PCWSTR::from_raw(key_name.as_ptr()),
                     0,
                     REG_SZ,
                     Some(std::slice::from_raw_parts(
-                        startup_wide.as_ptr() as *const u8,
+                        exe_buf.as_ptr() as *const u8,
                         byte_len as usize,
                     )),
                 );
@@ -1192,10 +1043,6 @@ fn set_startup_enabled(enable: bool) {
     }
 }
 
-fn startup_command_for_executable(exe_path: &str) -> String {
-    format!("\"{exe_path}\"")
-}
-
 // Dimensions matching the C# version
 const SEGMENT_W: i32 = 10;
 const SEGMENT_H: i32 = 13;
@@ -1205,48 +1052,116 @@ const CORNER_RADIUS: i32 = 2;
 
 const LEFT_DIVIDER_W: i32 = 3;
 const DIVIDER_RIGHT_MARGIN: i32 = 10;
-const PROVIDER_BADGE_W: i32 = 26;
-const PROVIDER_BADGE_RIGHT_MARGIN: i32 = 8;
 const LABEL_WIDTH: i32 = 18;
 const LABEL_RIGHT_MARGIN: i32 = 10;
 const BAR_RIGHT_MARGIN: i32 = 4;
 const TEXT_WIDTH: i32 = 62;
+const MODEL_RIGHT_MARGIN: i32 = 3;
 const RIGHT_MARGIN: i32 = 1;
 const WIDGET_HEIGHT: i32 = 46;
 
-fn total_widget_width() -> i32 {
-    sc(LEFT_DIVIDER_W)
-        + sc(DIVIDER_RIGHT_MARGIN)
-        + sc(PROVIDER_BADGE_W)
-        + sc(PROVIDER_BADGE_RIGHT_MARGIN)
-        + sc(LABEL_WIDTH)
-        + sc(LABEL_RIGHT_MARGIN)
-        + (sc(SEGMENT_W) + sc(SEGMENT_GAP)) * SEGMENT_COUNT
-        - sc(SEGMENT_GAP)
-        + sc(BAR_RIGHT_MARGIN)
-        + sc(TEXT_WIDTH)
-        + sc(RIGHT_MARGIN)
+fn is_drag_handle_point(client_x: i32, client_y: i32) -> bool {
+    let divider_h = sc(25);
+    let divider_top = (sc(WIDGET_HEIGHT) - divider_h) / 2;
+    client_x >= 0
+        && client_x < sc(LEFT_DIVIDER_W)
+        && client_y >= divider_top
+        && client_y < divider_top + divider_h
 }
 
-fn provider_accent(provider: ProviderKind) -> Color {
-    match provider {
-        ProviderKind::Claude => Color::from_hex("#D97757"),
-        ProviderKind::Codex => Color::from_hex("#10A37F"),
+fn cursor_is_on_drag_handle(hwnd: HWND) -> bool {
+    unsafe {
+        let mut pt = POINT::default();
+        if GetCursorPos(&mut pt).is_err() || !ScreenToClient(hwnd, &mut pt).as_bool() {
+            return false;
+        }
+        is_drag_handle_point(pt.x, pt.y)
     }
 }
 
-fn provider_badge_palette(provider: ProviderKind) -> (Color, Color, Color) {
-    match provider {
-        ProviderKind::Claude => (
-            Color::from_hex("#D97757"), // fill
-            Color::from_hex("#8E4A36"), // border
-            Color::from_hex("#FFFFFF"), // text
-        ),
-        ProviderKind::Codex => (
-            Color::from_hex("#10A37F"), // fill
-            Color::from_hex("#0A6A52"), // border
-            Color::from_hex("#FFFFFF"), // text
-        ),
+fn active_model_count(show_claude_code: bool, show_codex: bool, show_antigravity: bool) -> i32 {
+    (show_claude_code as i32 + show_codex as i32 + show_antigravity as i32).max(1)
+}
+
+fn row_bar_segment_count(active_models: i32) -> i32 {
+    match active_models {
+        1 => SEGMENT_COUNT,
+        2 => 5,
+        _ => 4,
+    }
+}
+
+fn total_widget_width_for(active_models: i32) -> i32 {
+    let bar_segments = row_bar_segment_count(active_models);
+    let model_width = (sc(SEGMENT_W) + sc(SEGMENT_GAP)) * bar_segments - sc(SEGMENT_GAP)
+        + sc(BAR_RIGHT_MARGIN)
+        + sc(TEXT_WIDTH);
+
+    sc(LEFT_DIVIDER_W)
+        + sc(DIVIDER_RIGHT_MARGIN)
+        + sc(LABEL_WIDTH)
+        + sc(LABEL_RIGHT_MARGIN)
+        + model_width * active_models
+        + sc(MODEL_RIGHT_MARGIN) * (active_models - 1)
+        + sc(RIGHT_MARGIN)
+}
+
+fn total_widget_width_for_state(state: &AppState) -> i32 {
+    total_widget_width_for(active_model_count(
+        state.show_claude_code,
+        state.show_codex,
+        state.show_antigravity,
+    ))
+}
+
+fn total_widget_width() -> i32 {
+    let active_models = {
+        let state = lock_state();
+        state
+            .as_ref()
+            .map(|s| active_model_count(s.show_claude_code, s.show_codex, s.show_antigravity))
+            .unwrap_or(1)
+    };
+    total_widget_width_for(active_models)
+}
+
+fn claude_accent_color() -> Color {
+    Color::from_hex("#D97757")
+}
+
+fn codex_accent_color(is_dark: bool) -> Color {
+    if is_dark {
+        Color::from_hex("#F5F5F5")
+    } else {
+        Color::from_hex("#1F1F1F")
+    }
+}
+
+fn antigravity_accent_color() -> Color {
+    Color::from_hex("#4285F4")
+}
+
+fn claude_usage_text_color(is_dark: bool) -> Color {
+    if is_dark {
+        Color::from_hex("#F09A7A")
+    } else {
+        Color::from_hex("#A94F32")
+    }
+}
+
+fn codex_usage_text_color(is_dark: bool) -> Color {
+    if is_dark {
+        Color::from_hex("#F5F5F5")
+    } else {
+        Color::from_hex("#1F1F1F")
+    }
+}
+
+fn antigravity_usage_text_color(is_dark: bool) -> Color {
+    if is_dark {
+        Color::from_hex("#8AB4F8")
+    } else {
+        Color::from_hex("#1967D2")
     }
 }
 
@@ -1258,20 +1173,37 @@ pub fn run() {
     }
     diagnose::log("window::run started");
 
-    // Single-instance guard: silently exit if another instance is running
+    // Single-instance guard: silently exit if another instance is running.
+    // Exception: when relaunched after an explorer restart (ENV_RELAUNCH set),
+    // wait for the previous instance to release the mutex, then take over.
+    let is_relaunch = std::env::var(ENV_RELAUNCH).is_ok();
     let mutex_name = native_interop::wide_str("Global\\ClaudeCodeUsageMonitor");
     let _mutex = unsafe {
-        let handle = CreateMutexW(None, false, PCWSTR::from_raw(mutex_name.as_ptr()));
+        let handle = CreateMutexW(None, true, PCWSTR::from_raw(mutex_name.as_ptr()));
         match handle {
             Ok(h) => {
                 if GetLastError() == ERROR_ALREADY_EXISTS {
-                    diagnose::log("startup aborted: another instance is already running");
-                    return;
+                    if is_relaunch {
+                        diagnose::log("relaunch: waiting for previous instance to exit");
+                        let wait_result = WaitForSingleObject(h, 10_000);
+                        if wait_result != WAIT_OBJECT_0 && wait_result != WAIT_ABANDONED {
+                            diagnose::log(format!(
+                                "startup aborted: previous instance did not exit cleanly ({wait_result:?})"
+                            ));
+                            return;
+                        }
+                    } else {
+                        diagnose::log("startup aborted: another instance is already running");
+                        return;
+                    }
                 }
                 h
             }
             Err(error) => {
-                diagnose::log_error("startup aborted: unable to create single-instance mutex", error);
+                diagnose::log_error(
+                    "startup aborted: unable to create single-instance mutex",
+                    error,
+                );
                 return;
             }
         }
@@ -1281,12 +1213,15 @@ pub fn run() {
 
     unsafe {
         let hinstance = GetModuleHandleW(PCWSTR::null()).unwrap();
+        let (large_icon, small_icon) = load_embedded_app_icons();
 
         let wc = WNDCLASSEXW {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
             style: CS_HREDRAW | CS_VREDRAW,
             lpfnWndProc: Some(wnd_proc),
             hInstance: HINSTANCE(hinstance.0),
+            hIcon: large_icon,
+            hIconSm: small_icon,
             hCursor: LoadCursorW(HINSTANCE::default(), IDC_ARROW).unwrap_or_default(),
             hbrBackground: HBRUSH(std::ptr::null_mut()),
             lpszClassName: PCWSTR::from_raw(class_name.as_ptr()),
@@ -1302,11 +1237,14 @@ pub fn run() {
         let language_override = settings.language.as_deref().and_then(LanguageId::from_code);
         let language = localization::resolve_language(language_override);
         let install_channel = updater::current_install_channel();
-        let active_provider = settings.active_provider.unwrap_or(ProviderKind::Claude);
-        let history_sync = settings.history_sync.clone();
 
         // Create as layered popup (will be reparented into taskbar)
         let title = native_interop::wide_str(language.strings().window_title);
+        let initial_model_count = active_model_count(
+            settings.show_claude_code,
+            settings.show_codex,
+            settings.show_antigravity,
+        );
         let hwnd = CreateWindowExW(
             WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_NOACTIVATE,
             PCWSTR::from_raw(class_name.as_ptr()),
@@ -1314,7 +1252,7 @@ pub fn run() {
             WS_POPUP,
             0,
             0,
-            total_widget_width(),
+            total_widget_width_for(initial_model_count),
             sc(WIDGET_HEIGHT),
             HWND::default(),
             HMENU::default(),
@@ -1322,6 +1260,24 @@ pub fn run() {
             None,
         )
         .unwrap();
+
+        if !large_icon.is_invalid() {
+            let _ = SendMessageW(
+                hwnd,
+                WM_SETICON,
+                WPARAM(ICON_BIG as usize),
+                LPARAM(large_icon.0 as isize),
+            );
+        }
+        if !small_icon.is_invalid() {
+            let _ = SendMessageW(
+                hwnd,
+                WM_SETICON,
+                WPARAM(ICON_SMALL as usize),
+                LPARAM(small_icon.0 as isize),
+            );
+        }
+
         diagnose::log(format!("main window created hwnd={:?}", hwnd));
 
         let is_dark = theme::is_dark_mode();
@@ -1339,51 +1295,44 @@ pub fn run() {
                 language_override,
                 language,
                 install_channel,
-                active_provider,
-                history_sync,
-                claude: ProviderState::default(),
-                codex: ProviderState::default(),
+                session_percent: 0.0,
+                session_text: "--".to_string(),
+                weekly_percent: 0.0,
+                weekly_text: "--".to_string(),
+                codex_session_percent: 0.0,
+                codex_session_text: "--".to_string(),
+                codex_weekly_percent: 0.0,
+                codex_weekly_text: "--".to_string(),
+                antigravity_session_percent: 0.0,
+                antigravity_session_text: "--".to_string(),
+                antigravity_weekly_percent: 0.0,
+                antigravity_weekly_text: "--".to_string(),
+                show_claude_code: settings.show_claude_code,
+                show_codex: settings.show_codex,
+                show_antigravity: settings.show_antigravity,
+                data: None,
                 poll_interval_ms: settings.poll_interval_ms,
                 retry_count: 0,
+                force_notify_auth_error: false,
+                auth_error_paused_polling: false,
+                auth_watch_mode: poller::CredentialWatchMode::ActiveSource,
+                auth_watch_snapshot: Vec::new(),
+                last_poll_ok: false,
                 update_status: UpdateStatus::Idle,
+                last_update_check_unix: settings.last_update_check_unix,
+                taskbar_index: settings.taskbar_index,
                 tray_offset: settings.tray_offset,
                 dragging: false,
                 drag_start_mouse_x: 0,
+                drag_start_client_x: 0,
                 drag_start_offset: 0,
+                widget_visible: settings.widget_visible,
             });
         }
 
         // Try to embed in taskbar
-        if let Some(taskbar_hwnd) = native_interop::find_taskbar() {
-            diagnose::log(format!("taskbar found hwnd={:?}", taskbar_hwnd));
-            native_interop::embed_in_taskbar(hwnd, taskbar_hwnd);
+        if attach_to_taskbar(hwnd, settings.taskbar_index) {
             embedded = true;
-
-            let mut state = lock_state();
-            let s = state.as_mut().unwrap();
-            s.taskbar_hwnd = Some(taskbar_hwnd);
-            s.embedded = true;
-
-            let tray_notify = native_interop::find_child_window(taskbar_hwnd, "TrayNotifyWnd");
-            s.tray_notify_hwnd = tray_notify;
-            if tray_notify.is_some() {
-                diagnose::log("TrayNotifyWnd found");
-            } else {
-                diagnose::log("TrayNotifyWnd not found");
-            }
-
-            if let Some(tray_hwnd) = tray_notify {
-                let thread_id = native_interop::get_window_thread_id(tray_hwnd);
-                let hook = native_interop::set_tray_event_hook(thread_id, on_tray_location_changed);
-                s.win_event_hook = hook;
-                if hook.is_some() {
-                    diagnose::log("tray event hook installed");
-                } else {
-                    diagnose::log("tray event hook could not be installed");
-                }
-            }
-        } else {
-            diagnose::log("taskbar not found; using fallback popup window");
         }
 
         // If not embedded, fall back to topmost popup with SetLayeredWindowAttributes
@@ -1400,9 +1349,14 @@ pub fn run() {
             );
         }
 
-        // Position and show
+        // Register system tray icon(s)
+        sync_tray_icons(hwnd);
+
+        // Position and show (only if widget_visible preference is true)
         position_at_taskbar();
-        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        if settings.widget_visible {
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        }
         diagnose::log("window shown");
 
         // Initial render via UpdateLayeredWindow (for embedded) or InvalidateRect (fallback)
@@ -1418,12 +1372,31 @@ pub fn run() {
         };
         SetTimer(hwnd, TIMER_POLL, initial_poll_ms, None);
 
+        // Watch for explorer.exe restarts so we can re-embed and re-add the tray
+        // icon (the shell discards tray registrations when it restarts). This
+        // runs on a dedicated thread, NOT a window timer: once explorer destroys
+        // the taskbar, our embedded child window stops receiving all messages
+        // (WM_TIMER included), so a timer would never fire again.
+        spawn_taskbar_watchdog();
+
         // Initial poll
         let send_hwnd = SendHwnd::from_hwnd(hwnd);
         std::thread::spawn(move || {
             diagnose::log("initial poll thread started");
             do_poll(send_hwnd);
         });
+
+        schedule_auto_update_check(hwnd);
+        let should_check_updates = {
+            let state = lock_state();
+            state
+                .as_ref()
+                .map(|s| auto_update_check_due(s.last_update_check_unix))
+                .unwrap_or(false)
+        };
+        if should_check_updates {
+            begin_update_check(hwnd, false);
+        }
 
         // Initial theme check
         check_theme_change();
@@ -1447,26 +1420,47 @@ fn render_layered() {
         is_dark,
         embedded,
         strings,
-        active_provider,
         session_pct,
         session_text,
         weekly_pct,
         weekly_text,
+        codex_session_pct,
+        codex_session_text,
+        codex_weekly_pct,
+        codex_weekly_text,
+        antigravity_session_pct,
+        antigravity_session_text,
+        antigravity_weekly_pct,
+        antigravity_weekly_text,
+        show_claude_code,
+        show_codex,
+        show_antigravity,
     ) = {
         let state = lock_state();
-        let Some(s) = state.as_ref() else { return };
-        let provider_state = active_provider_state(s);
-        (
-            s.hwnd,
-            s.is_dark,
-            s.embedded,
-            s.language.strings(),
-            s.active_provider,
-            provider_state.session_percent,
-            provider_state.session_text.clone(),
-            provider_state.weekly_percent,
-            provider_state.weekly_text.clone(),
-        )
+        match state.as_ref() {
+            Some(s) => (
+                s.hwnd,
+                s.is_dark,
+                s.embedded,
+                s.language.strings(),
+                s.session_percent,
+                s.session_text.clone(),
+                s.weekly_percent,
+                s.weekly_text.clone(),
+                s.codex_session_percent,
+                s.codex_session_text.clone(),
+                s.codex_weekly_percent,
+                s.codex_weekly_text.clone(),
+                s.antigravity_session_percent,
+                s.antigravity_session_text.clone(),
+                s.antigravity_weekly_percent,
+                s.antigravity_weekly_text.clone(),
+                s.show_claude_code,
+                s.show_codex,
+                s.show_antigravity,
+            ),
+            None => return,
+        }
     };
 
     let hwnd = hwnd_val.to_hwnd();
@@ -1482,7 +1476,9 @@ fn render_layered() {
     let width = total_widget_width();
     let height = sc(WIDGET_HEIGHT);
 
-    let accent = provider_accent(active_provider);
+    let accent = claude_accent_color();
+    let codex_accent = codex_accent_color(is_dark);
+    let antigravity_accent = antigravity_accent_color();
     let track = if is_dark {
         Color::from_hex("#444444")
     } else {
@@ -1542,11 +1538,23 @@ fn render_layered() {
             &accent,
             &track,
             strings,
-            active_provider,
             session_pct,
             &session_text,
             weekly_pct,
             &weekly_text,
+            codex_session_pct,
+            &codex_session_text,
+            codex_weekly_pct,
+            &codex_weekly_text,
+            antigravity_session_pct,
+            &antigravity_session_text,
+            antigravity_weekly_pct,
+            &antigravity_weekly_text,
+            show_claude_code,
+            show_codex,
+            show_antigravity,
+            &codex_accent,
+            &antigravity_accent,
         );
 
         // Background pixels → alpha 1 (nearly invisible but still hittable for right-click).
@@ -1606,11 +1614,23 @@ fn paint_content(
     accent: &Color,
     track: &Color,
     strings: Strings,
-    active_provider: ProviderKind,
     session_pct: f64,
     session_text: &str,
     weekly_pct: f64,
     weekly_text: &str,
+    codex_session_pct: f64,
+    codex_session_text: &str,
+    codex_weekly_pct: f64,
+    codex_weekly_text: &str,
+    antigravity_session_pct: f64,
+    antigravity_session_text: &str,
+    antigravity_weekly_pct: f64,
+    antigravity_weekly_text: &str,
+    show_claude_code: bool,
+    show_codex: bool,
+    show_antigravity: bool,
+    codex_accent: &Color,
+    antigravity_accent: &Color,
 ) {
     unsafe {
         let client_rect = RECT {
@@ -1662,17 +1682,8 @@ fn paint_content(
         let _ = DeleteObject(right_brush);
 
         let content_x = sc(LEFT_DIVIDER_W) + sc(DIVIDER_RIGHT_MARGIN);
-        let badge_rect = RECT {
-            left: content_x,
-            top: (height - sc(24)) / 2,
-            right: content_x + sc(PROVIDER_BADGE_W),
-            bottom: (height - sc(24)) / 2 + sc(24),
-        };
-        draw_provider_badge(hdc, &badge_rect, active_provider, accent);
-
-        let rows_x = content_x + sc(PROVIDER_BADGE_W) + sc(PROVIDER_BADGE_RIGHT_MARGIN);
-        let row1_y = sc(5);
-        let row2_y = sc(5) + sc(SEGMENT_H) + sc(10);
+        let row2_y = height - sc(5) - sc(SEGMENT_H);
+        let row1_y = row2_y - sc(10) - sc(SEGMENT_H);
 
         let _ = SetBkMode(hdc, TRANSPARENT);
         let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
@@ -1698,22 +1709,44 @@ fn paint_content(
 
         draw_row(
             hdc,
-            rows_x,
+            content_x,
             row1_y,
+            is_dark,
+            text_color,
             strings.session_window,
             session_pct,
             session_text,
+            codex_session_pct,
+            codex_session_text,
+            antigravity_session_pct,
+            antigravity_session_text,
+            show_claude_code,
+            show_codex,
+            show_antigravity,
             accent,
+            codex_accent,
+            antigravity_accent,
             track,
         );
         draw_row(
             hdc,
-            rows_x,
+            content_x,
             row2_y,
+            is_dark,
+            text_color,
             strings.weekly_window,
             weekly_pct,
             weekly_text,
+            codex_weekly_pct,
+            codex_weekly_text,
+            antigravity_weekly_pct,
+            antigravity_weekly_text,
+            show_claude_code,
+            show_codex,
+            show_antigravity,
             accent,
+            codex_accent,
+            antigravity_accent,
             track,
         );
 
@@ -1724,91 +1757,182 @@ fn paint_content(
 
 fn do_poll(send_hwnd: SendHwnd) {
     let hwnd = send_hwnd.to_hwnd();
-    let claude_handle = std::thread::spawn(poller::poll);
-    let codex_handle = std::thread::spawn(|| {
-        let activity = codex_poller::read_activity_summary();
-        (codex_poller::poll(), activity)
-    });
+    let (show_claude_code, show_codex, show_antigravity) = {
+        let state = lock_state();
+        state
+            .as_ref()
+            .map(|s| (s.show_claude_code, s.show_codex, s.show_antigravity))
+            .unwrap_or((true, false, false))
+    };
 
-    let claude_result = claude_handle
-        .join()
-        .unwrap_or(Err(poller::PollError::RequestFailed));
-    let (codex_result, codex_activity) = codex_handle
-        .join()
-        .unwrap_or((Err(codex_poller::PollError::RequestFailed), None));
-
-    let mut any_ok = false;
-    let mut needs_fast_reset_poll = false;
-
-    {
-        let mut state = lock_state();
-        if let Some(s) = state.as_mut() {
-            match claude_result {
-                Ok(data) => {
-                    needs_fast_reset_poll |= poller::is_past_reset(&data);
-                    set_provider_data(s, ProviderKind::Claude, data, None);
-                    any_ok = true;
+    match poller::poll(show_claude_code, show_codex, show_antigravity) {
+        Ok(data) => {
+            let mut state = lock_state();
+            if let Some(s) = state.as_mut() {
+                if let Some(claude_code) = data.claude_code.as_ref() {
+                    s.session_percent = claude_code.session.percentage;
+                    s.weekly_percent = claude_code.weekly.percentage;
+                } else if s.show_claude_code {
+                    s.session_percent = 0.0;
+                    s.weekly_percent = 0.0;
                 }
-                Err(poller::PollError::NoCredentials | poller::PollError::TokenExpired) => {
-                    set_provider_unavailable(s, ProviderKind::Claude);
+                if let Some(codex) = data.codex.as_ref() {
+                    s.codex_session_percent = codex.session.percentage;
+                    s.codex_weekly_percent = codex.weekly.percentage;
+                } else if s.show_codex {
+                    s.codex_session_percent = 0.0;
+                    s.codex_weekly_percent = 0.0;
                 }
-                Err(poller::PollError::RequestFailed) => {
-                    set_provider_loading(s, ProviderKind::Claude);
+                if let Some(antigravity) = data.antigravity.as_ref() {
+                    s.antigravity_session_percent = antigravity.session.percentage;
+                    s.antigravity_weekly_percent = antigravity.weekly.percentage;
+                } else if s.show_antigravity {
+                    s.antigravity_session_percent = 0.0;
+                    s.antigravity_weekly_percent = 0.0;
                 }
-            }
-
-                // Recovered from errors — restore normal poll interval
-            provider_state_mut(s, ProviderKind::Codex).activity = codex_activity;
-            match codex_result {
-                Ok(data) => {
-                    needs_fast_reset_poll |= poller::is_past_reset(&data);
-                    set_provider_data(
-                        s,
-                        ProviderKind::Codex,
-                        data,
-                        provider_state(s, ProviderKind::Codex).activity.clone(),
-                    );
-                    any_ok = true;
-                }
-                Err(codex_poller::PollError::NoCredentials | codex_poller::PollError::CliUnavailable) => {
-                    set_provider_unavailable(s, ProviderKind::Codex);
-                }
-                Err(codex_poller::PollError::RequestFailed) => {
-                    set_provider_loading(s, ProviderKind::Codex);
-                }
-            }
-
-            refresh_usage_texts(s);
-            auto_select_active_provider(s);
-            if any_ok {
-                if s.retry_count > 0 {
-                    s.retry_count = 0;
+                // Stop fast-poll if reset data is now fresh
+                if !poller::app_is_past_reset(&data) {
                     unsafe {
-                        SetTimer(hwnd, TIMER_POLL, s.poll_interval_ms, None);
+                        let _ = KillTimer(hwnd, TIMER_RESET_POLL);
                     }
                 }
-            } else {
-                s.retry_count = s.retry_count.saturating_add(1);
-                let backoff = RETRY_BASE_MS
-                    .saturating_mul(1u32.checked_shl(s.retry_count - 1).unwrap_or(u32::MAX));
-                let retry_ms = backoff.min(s.poll_interval_ms);
 
-                unsafe {
-                    SetTimer(hwnd, TIMER_POLL, retry_ms, None);
+                s.data = Some(data);
+                s.last_poll_ok = true;
+                refresh_usage_texts(s);
+
+                // Recovered from errors — restore normal poll interval
+                if s.retry_count > 0 {
+                    s.retry_count = 0;
+                    let interval = s.poll_interval_ms;
+                    unsafe {
+                        SetTimer(hwnd, TIMER_POLL, interval, None);
+                    }
                 }
+                s.force_notify_auth_error = false;
+                s.auth_error_paused_polling = false;
+                s.auth_watch_mode = poller::CredentialWatchMode::ActiveSource;
+                s.auth_watch_snapshot.clear();
+            }
+
+            unsafe {
+                let _ = PostMessageW(hwnd, WM_APP_USAGE_UPDATED, WPARAM(0), LPARAM(0));
             }
         }
-    }
+        Err(e) => {
+            let auth_watch = match e {
+                poller::PollError::AuthRequired | poller::PollError::TokenExpired
+                    if show_antigravity && !show_claude_code && !show_codex =>
+                {
+                    Some((
+                        poller::CredentialWatchMode::Antigravity,
+                        poller::credential_watch_snapshot(poller::CredentialWatchMode::Antigravity),
+                    ))
+                }
+                poller::PollError::AuthRequired | poller::PollError::TokenExpired => Some((
+                    poller::CredentialWatchMode::ActiveSource,
+                    poller::credential_watch_snapshot(poller::CredentialWatchMode::ActiveSource),
+                )),
+                poller::PollError::NoCredentials => Some((
+                    poller::CredentialWatchMode::AllSources,
+                    poller::credential_watch_snapshot(poller::CredentialWatchMode::AllSources),
+                )),
+                poller::PollError::RequestFailed => None,
+            };
+            // Distinguish auth-required errors from transient errors.
+            let notify_auth_error = {
+                let mut state = lock_state();
+                let mut should_notify = false;
+                if let Some(s) = state.as_mut() {
+                    s.last_poll_ok = false;
+                    match auth_watch {
+                        Some((watch_mode, watch_snapshot)) => {
+                            // Only show the balloon on the first failure so it doesn't spam.
+                            if s.retry_count == 0 || s.force_notify_auth_error {
+                                should_notify = true;
+                            }
+                            s.force_notify_auth_error = false;
+                            s.auth_error_paused_polling = true;
+                            s.auth_watch_mode = watch_mode;
+                            s.auth_watch_snapshot = watch_snapshot;
+                            s.session_text = "!".to_string();
+                            s.weekly_text = "!".to_string();
+                            s.codex_session_text = "!".to_string();
+                            s.codex_weekly_text = "!".to_string();
+                            s.antigravity_session_text = "!".to_string();
+                            s.antigravity_weekly_text = "!".to_string();
+                            s.retry_count = s.retry_count.saturating_add(1);
+                            unsafe {
+                                let _ = KillTimer(hwnd, TIMER_POLL);
+                                let _ = KillTimer(hwnd, TIMER_RESET_POLL);
+                                let _ = KillTimer(hwnd, TIMER_COUNTDOWN);
+                                SetTimer(hwnd, TIMER_POLL, s.poll_interval_ms, None);
+                            }
+                        }
+                        _ => {
+                            // Transient network / credential-missing errors: exponential backoff.
+                            s.force_notify_auth_error = false;
+                            s.auth_error_paused_polling = false;
+                            s.auth_watch_mode = poller::CredentialWatchMode::ActiveSource;
+                            s.auth_watch_snapshot.clear();
+                            s.session_text = "...".to_string();
+                            s.weekly_text = "...".to_string();
+                            s.codex_session_text = "...".to_string();
+                            s.codex_weekly_text = "...".to_string();
+                            s.antigravity_session_text = "...".to_string();
+                            s.antigravity_weekly_text = "...".to_string();
+                            s.retry_count = s.retry_count.saturating_add(1);
+                            let backoff = RETRY_BASE_MS.saturating_mul(
+                                1u32.checked_shl(s.retry_count - 1).unwrap_or(u32::MAX),
+                            );
+                            let retry_ms = backoff.min(s.poll_interval_ms);
+                            unsafe {
+                                let _ = KillTimer(hwnd, TIMER_RESET_POLL);
+                                SetTimer(hwnd, TIMER_POLL, retry_ms, None);
+                            }
+                        }
+                    }
+                }
+                should_notify
+            };
 
-    unsafe {
-            // Show refresh indicator — retry will recover silently
-        if needs_fast_reset_poll {
-            SetTimer(hwnd, TIMER_RESET_POLL, 5_000, None);
-        } else {
-            let _ = KillTimer(hwnd, TIMER_RESET_POLL);
+            if notify_auth_error {
+                let balloon = {
+                    let state = lock_state();
+                    state.as_ref().map(|s| {
+                        if s.show_claude_code {
+                            (
+                                s.language.strings(),
+                                tray_icon::TrayIconKind::Claude,
+                                s.language.strings().token_expired_title,
+                                s.language.strings().token_expired_body,
+                            )
+                        } else if s.show_codex {
+                            (
+                                s.language.strings(),
+                                tray_icon::TrayIconKind::Codex,
+                                s.language.strings().codex_token_expired_title,
+                                s.language.strings().codex_token_expired_body,
+                            )
+                        } else {
+                            (
+                                s.language.strings(),
+                                tray_icon::TrayIconKind::Antigravity,
+                                s.language.strings().antigravity_token_expired_title,
+                                s.language.strings().antigravity_token_expired_body,
+                            )
+                        }
+                    })
+                };
+                if let Some((_strings, kind, title, body)) = balloon {
+                    tray_icon::notify_balloon(hwnd, kind, title, body);
+                }
+            }
+
+            unsafe {
+                let _ = PostMessageW(hwnd, WM_APP_USAGE_UPDATED, WPARAM(0), LPARAM(0));
+            }
         }
-
-        let _ = PostMessageW(hwnd, WM_APP_USAGE_UPDATED, WPARAM(0), LPARAM(0));
     }
 }
 
@@ -1819,33 +1943,48 @@ fn schedule_countdown_timer() {
         None => return,
     };
 
-    if !active_provider_state(s).last_poll_ok {
+    let hwnd = s.hwnd.to_hwnd();
+    if !s.last_poll_ok {
+        unsafe {
+            let _ = KillTimer(hwnd, TIMER_COUNTDOWN);
+            let _ = KillTimer(hwnd, TIMER_RESET_POLL);
+        }
         return;
     }
 
-    let data = match &active_provider_state(s).data {
+    let data = match &s.data {
         Some(d) => d,
         None => return,
     };
 
-    let hwnd = s.hwnd.to_hwnd();
-
     // If a reset time has passed, poll every 5s to pick up fresh data
-    if poller::is_past_reset(data) {
+    if poller::app_is_past_reset(data) {
         unsafe {
             SetTimer(hwnd, TIMER_RESET_POLL, 5_000, None);
         }
     }
 
-    let session_delay = poller::time_until_display_change(data.session.resets_at);
-    let weekly_delay = poller::time_until_display_change(data.weekly.resets_at);
-
-    let min_delay = match (session_delay, weekly_delay) {
-        (Some(a), Some(b)) => Some(a.min(b)),
-        (Some(a), None) => Some(a),
-        (None, Some(b)) => Some(b),
-        (None, None) => None,
-    };
+    let delays = [
+        data.claude_code
+            .as_ref()
+            .and_then(|usage| poller::time_until_display_change(usage.session.resets_at)),
+        data.claude_code
+            .as_ref()
+            .and_then(|usage| poller::time_until_display_change(usage.weekly.resets_at)),
+        data.codex
+            .as_ref()
+            .and_then(|usage| poller::time_until_display_change(usage.session.resets_at)),
+        data.codex
+            .as_ref()
+            .and_then(|usage| poller::time_until_display_change(usage.weekly.resets_at)),
+        data.antigravity
+            .as_ref()
+            .and_then(|usage| poller::time_until_display_change(usage.session.resets_at)),
+        data.antigravity
+            .as_ref()
+            .and_then(|usage| poller::time_until_display_change(usage.weekly.resets_at)),
+    ];
+    let min_delay = delays.into_iter().flatten().min();
 
     let ms = min_delay
         .unwrap_or(Duration::from_secs(60))
@@ -1891,36 +2030,61 @@ fn update_display() {
     };
 
     // Don't overwrite error text with stale cached data
-    if !active_provider_state(s).last_poll_ok {
+    if !s.last_poll_ok {
         return;
     }
 
     refresh_usage_texts(s);
 }
 
+fn suppress_tray_reposition_for(duration: Duration) {
+    let mut until = SUPPRESS_TRAY_REPOSITION_UNTIL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    *until = Some(Instant::now() + duration);
+}
+
+fn tray_reposition_is_suppressed() -> bool {
+    let now = Instant::now();
+    let mut until = SUPPRESS_TRAY_REPOSITION_UNTIL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    match *until {
+        Some(deadline) if now < deadline => true,
+        Some(_) => {
+            *until = None;
+            false
+        }
+        None => false,
+    }
+}
+
 fn position_at_taskbar() {
     refresh_dpi();
-    let state = lock_state();
-    let s = match state.as_ref() {
-        Some(s) => s,
-        None => return,
-    };
+    // Drop the app-state lock before any Win32 call that may synchronously
+    // re-enter our window procedure.
+    let (hwnd, embedded, tray_offset, taskbar_hwnd) = {
+        let state = lock_state();
+        let s = match state.as_ref() {
+            Some(s) => s,
+            None => return,
+        };
 
-    // Don't fight the user's drag
-    if s.dragging {
-        return;
-    }
-
-    let hwnd = s.hwnd.to_hwnd();
-    let embedded = s.embedded;
-    let tray_offset = s.tray_offset;
-
-    let taskbar_hwnd = match s.taskbar_hwnd {
-        Some(h) => h,
-        None => {
-            diagnose::log("position_at_taskbar skipped: no taskbar handle");
+        // Don't fight the user's drag
+        if s.dragging {
             return;
         }
+
+        let taskbar_hwnd = match s.taskbar_hwnd {
+            Some(h) => h,
+            None => {
+                diagnose::log("position_at_taskbar skipped: no taskbar handle");
+                return;
+            }
+        };
+
+        (s.hwnd.to_hwnd(), s.embedded, s.tray_offset, taskbar_hwnd)
     };
 
     let taskbar_rect = match native_interop::get_taskbar_rect(taskbar_hwnd) {
@@ -1933,6 +2097,8 @@ fn position_at_taskbar() {
 
     let taskbar_height = taskbar_rect.bottom - taskbar_rect.top;
     let mut tray_left = taskbar_rect.right;
+    let anchor_top = taskbar_rect.top;
+    let anchor_height = taskbar_height;
 
     if let Some(tray_hwnd) = native_interop::find_child_window(taskbar_hwnd, "TrayNotifyWnd") {
         if let Some(tray_rect) = native_interop::get_window_rect_safe(tray_hwnd) {
@@ -1941,25 +2107,48 @@ fn position_at_taskbar() {
     }
 
     let widget_width = total_widget_width();
+    let max_offset = (tray_left - taskbar_rect.left - widget_width).max(0);
+    let tray_offset = tray_offset.clamp(0, max_offset);
+    let offset_changed = {
+        let mut state = lock_state();
+        if let Some(s) = state.as_mut() {
+            if s.tray_offset != tray_offset {
+                s.tray_offset = tray_offset;
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    };
+    if offset_changed {
+        save_state_settings();
+    }
 
     let widget_height = sc(WIDGET_HEIGHT);
+    let y = compute_anchor_y(anchor_top, anchor_height, widget_height);
     if embedded {
         // Child window: coordinates relative to parent (taskbar)
         let x = tray_left - taskbar_rect.left - widget_width - tray_offset;
-        let y = (taskbar_height - widget_height) / 2;
-        native_interop::move_window(hwnd, x, y, widget_width, widget_height);
+        native_interop::move_window(hwnd, x, y - taskbar_rect.top, widget_width, widget_height);
         diagnose::log(format!(
-            "positioned embedded widget at x={x} y={y} w={widget_width} h={widget_height}"
+            "positioned embedded widget at x={x} y={} w={widget_width} h={widget_height}",
+            y - taskbar_rect.top
         ));
     } else {
         // Topmost popup: screen coordinates
         let x = tray_left - widget_width - tray_offset;
-        let y = taskbar_rect.top + (taskbar_height - widget_height) / 2;
         native_interop::move_window(hwnd, x, y, widget_width, widget_height);
         diagnose::log(format!(
             "positioned fallback widget at x={x} y={y} w={widget_width} h={widget_height}"
         ));
     }
+}
+
+fn compute_anchor_y(anchor_top: i32, anchor_height: i32, widget_height: i32) -> i32 {
+    let anchor_bottom = anchor_top + anchor_height;
+    (anchor_bottom - widget_height).max(anchor_top)
 }
 
 /// WinEvent callback for tray icon location changes
@@ -1984,6 +2173,10 @@ unsafe extern "system" fn on_tray_location_changed(
     };
 
     if is_tray {
+        if tray_reposition_is_suppressed() {
+            return;
+        }
+
         let should_reposition = {
             let mut last = LAST_REPOSITION.lock().unwrap_or_else(|e| e.into_inner());
             let now = std::time::Instant::now();
@@ -2050,10 +2243,43 @@ unsafe extern "system" fn wnd_proc(
             let timer_id = wparam.0;
             match timer_id {
                 TIMER_POLL => {
-                    let sh = SendHwnd::from_hwnd(hwnd);
-                    std::thread::spawn(move || {
-                        do_poll(sh);
-                    });
+                    let auth_watch = {
+                        let state = lock_state();
+                        state.as_ref().map(|s| {
+                            (
+                                s.auth_error_paused_polling,
+                                s.auth_watch_mode,
+                                s.auth_watch_snapshot.clone(),
+                            )
+                        })
+                    };
+                    match auth_watch {
+                        Some((true, watch_mode, previous_snapshot)) => {
+                            let current_snapshot = poller::credential_watch_snapshot(watch_mode);
+                            if current_snapshot != previous_snapshot {
+                                let mut state = lock_state();
+                                if let Some(s) = state.as_mut() {
+                                    if s.auth_error_paused_polling
+                                        && s.auth_watch_mode == watch_mode
+                                    {
+                                        s.auth_watch_snapshot = current_snapshot;
+                                    }
+                                }
+                                drop(state);
+                                let sh = SendHwnd::from_hwnd(hwnd);
+                                std::thread::spawn(move || {
+                                    do_poll(sh);
+                                });
+                            }
+                        }
+                        Some((false, _, _)) => {
+                            let sh = SendHwnd::from_hwnd(hwnd);
+                            std::thread::spawn(move || {
+                                do_poll(sh);
+                            });
+                        }
+                        None => {}
+                    }
                 }
                 TIMER_COUNTDOWN => {
                     update_display();
@@ -2061,10 +2287,22 @@ unsafe extern "system" fn wnd_proc(
                     schedule_countdown_timer();
                 }
                 TIMER_RESET_POLL => {
-                    let sh = SendHwnd::from_hwnd(hwnd);
-                    std::thread::spawn(move || {
-                        do_poll(sh);
-                    });
+                    let should_poll = {
+                        let state = lock_state();
+                        state
+                            .as_ref()
+                            .map(|s| !s.auth_error_paused_polling)
+                            .unwrap_or(false)
+                    };
+                    if should_poll {
+                        let sh = SendHwnd::from_hwnd(hwnd);
+                        std::thread::spawn(move || {
+                            do_poll(sh);
+                        });
+                    }
+                }
+                TIMER_UPDATE_CHECK => {
+                    begin_update_check(hwnd, false);
                 }
                 _ => {}
             }
@@ -2075,47 +2313,50 @@ unsafe extern "system" fn wnd_proc(
             check_language_change();
             render_layered();
             schedule_countdown_timer();
+            suppress_tray_reposition_for(Duration::from_millis(
+                TRAY_ICON_UPDATE_REPOSITION_SUPPRESS_MS,
+            ));
+            sync_tray_icons(hwnd);
             LRESULT(0)
         }
-        WM_APP_UPDATE_CHECK_COMPLETE => LRESULT(0),
+        WM_APP_UPDATE_CHECK_COMPLETE => {
+            schedule_auto_update_check(hwnd);
+            LRESULT(0)
+        }
         WM_SETCURSOR => {
             let is_dragging = {
                 let state = lock_state();
                 state.as_ref().map(|s| s.dragging).unwrap_or(false)
             };
-            // Always show resize cursor while dragging or when hovering divider zone
-            let hit_test = (lparam.0 & 0xFFFF) as u16;
             if is_dragging {
                 let cursor = LoadCursorW(HINSTANCE::default(), IDC_SIZEWE).unwrap_or_default();
                 SetCursor(cursor);
                 return LRESULT(1);
             }
-            if hit_test == 1 {
-                // HTCLIENT
-                let mut pt = POINT::default();
-                let _ = GetCursorPos(&mut pt);
-                let _ = ScreenToClient(hwnd, &mut pt);
-                if pt.x < sc(DIVIDER_HIT_ZONE) {
-                    let cursor = LoadCursorW(HINSTANCE::default(), IDC_SIZEWE).unwrap_or_default();
-                    SetCursor(cursor);
-                    return LRESULT(1);
-                }
+            if cursor_is_on_drag_handle(hwnd) {
+                let cursor = LoadCursorW(HINSTANCE::default(), IDC_SIZEWE).unwrap_or_default();
+                SetCursor(cursor);
+                return LRESULT(1);
             }
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_LBUTTONDOWN => {
             let client_x = (lparam.0 & 0xFFFF) as i16 as i32;
-            if client_x < sc(DIVIDER_HIT_ZONE) {
-                let mut pt = POINT::default();
-                let _ = GetCursorPos(&mut pt);
-                let mut state = lock_state();
-                if let Some(s) = state.as_mut() {
-                    s.dragging = true;
-                    s.drag_start_mouse_x = pt.x;
-                    s.drag_start_offset = s.tray_offset;
-                }
-                SetCapture(hwnd);
+            let client_y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
+            if !is_drag_handle_point(client_x, client_y) {
+                return LRESULT(0);
             }
+
+            let mut pt = POINT::default();
+            let _ = GetCursorPos(&mut pt);
+            let mut state = lock_state();
+            if let Some(s) = state.as_mut() {
+                s.dragging = true;
+                s.drag_start_mouse_x = pt.x;
+                s.drag_start_client_x = client_x;
+                s.drag_start_offset = s.tray_offset;
+            }
+            SetCapture(hwnd);
             LRESULT(0)
         }
         WM_MOUSEMOVE => {
@@ -2126,98 +2367,103 @@ unsafe extern "system" fn wnd_proc(
             if is_dragging {
                 let mut pt = POINT::default();
                 let _ = GetCursorPos(&mut pt);
+                let move_target = {
+                    let mut state = lock_state();
+                    let s = match state.as_mut() {
+                        Some(s) => s,
+                        None => return LRESULT(0),
+                    };
 
-                let mut state = lock_state();
-                let s = match state.as_mut() {
-                    Some(s) => s,
-                    None => return LRESULT(0),
+                    // Moving mouse left = positive delta = larger offset (further left)
+                    let delta = s.drag_start_mouse_x - pt.x;
+                    let mut new_offset = s.drag_start_offset + delta;
+
+                    // Clamp: offset >= 0 (can't go right of default)
+                    if new_offset < 0 {
+                        new_offset = 0;
+                    }
+
+                    let taskbar_hwnd = s.taskbar_hwnd;
+                    let embedded = s.embedded;
+                    let hwnd_val = s.hwnd.to_hwnd();
+
+                    // Clamp: don't go past left edge of taskbar
+                    if let Some(taskbar_hwnd) = taskbar_hwnd {
+                        if let Some(taskbar_rect) = native_interop::get_taskbar_rect(taskbar_hwnd) {
+                            let mut tray_left = taskbar_rect.right;
+                            if let Some(tray_hwnd) =
+                                native_interop::find_child_window(taskbar_hwnd, "TrayNotifyWnd")
+                            {
+                                if let Some(tray_rect) =
+                                    native_interop::get_window_rect_safe(tray_hwnd)
+                                {
+                                    tray_left = tray_rect.left;
+                                }
+                            }
+                            let widget_width = total_widget_width_for_state(s);
+                            let max_offset = (tray_left - taskbar_rect.left - widget_width).max(0);
+                            if new_offset > max_offset {
+                                new_offset = max_offset;
+                            }
+
+                            s.tray_offset = new_offset;
+
+                            let taskbar_height = taskbar_rect.bottom - taskbar_rect.top;
+                            let anchor_top = taskbar_rect.top;
+                            let anchor_height = taskbar_height;
+                            let widget_height = sc(WIDGET_HEIGHT);
+                            let y = compute_anchor_y(anchor_top, anchor_height, widget_height);
+                            let x = if embedded {
+                                tray_left - taskbar_rect.left - widget_width - new_offset
+                            } else {
+                                tray_left - widget_width - new_offset
+                            };
+                            Some((
+                                hwnd_val,
+                                embedded,
+                                x,
+                                y,
+                                taskbar_rect.top,
+                                widget_width,
+                                widget_height,
+                            ))
+                        } else {
+                            s.tray_offset = new_offset;
+                            None
+                        }
+                    } else {
+                        s.tray_offset = new_offset;
+                        None
+                    }
                 };
 
-                // Moving mouse left = positive delta = larger offset (further left)
-                let delta = s.drag_start_mouse_x - pt.x;
-                let mut new_offset = s.drag_start_offset + delta;
-
-                // Clamp: offset >= 0 (can't go right of default)
-                if new_offset < 0 {
-                    new_offset = 0;
-                }
-
-                // Clamp: don't go past left edge of taskbar
-                if let Some(taskbar_hwnd) = s.taskbar_hwnd {
-                    if let Some(taskbar_rect) = native_interop::get_taskbar_rect(taskbar_hwnd) {
-                        let mut tray_left = taskbar_rect.right;
-                        if let Some(tray_hwnd) =
-                            native_interop::find_child_window(taskbar_hwnd, "TrayNotifyWnd")
-                        {
-                            if let Some(tray_rect) = native_interop::get_window_rect_safe(tray_hwnd)
-                            {
-                                tray_left = tray_rect.left;
-                            }
-                        }
-                        let widget_width = total_widget_width();
-                        let max_offset = if s.embedded {
-                            tray_left - taskbar_rect.left - widget_width
-                        } else {
-                            tray_left - taskbar_rect.left - widget_width
-                        };
-                        if new_offset > max_offset {
-                            new_offset = max_offset;
-                        }
-                    }
-                }
-
-                s.tray_offset = new_offset;
-
-                // Move window directly
-                let hwnd_val = s.hwnd.to_hwnd();
-                if let Some(taskbar_hwnd) = s.taskbar_hwnd {
-                    if let Some(taskbar_rect) = native_interop::get_taskbar_rect(taskbar_hwnd) {
-                        let taskbar_height = taskbar_rect.bottom - taskbar_rect.top;
-                        let mut tray_left = taskbar_rect.right;
-                        if let Some(tray_hwnd) =
-                            native_interop::find_child_window(taskbar_hwnd, "TrayNotifyWnd")
-                        {
-                            if let Some(tray_rect) = native_interop::get_window_rect_safe(tray_hwnd)
-                            {
-                                tray_left = tray_rect.left;
-                            }
-                        }
-                        let widget_width = total_widget_width();
-                        let widget_height = sc(WIDGET_HEIGHT);
-                        if s.embedded {
-                            let x = tray_left - taskbar_rect.left - widget_width - new_offset;
-                            let y = (taskbar_height - widget_height) / 2;
-                            native_interop::move_window(
-                                hwnd_val,
-                                x,
-                                y,
-                                widget_width,
-                                widget_height,
-                            );
-                        } else {
-                            let x = tray_left - widget_width - new_offset;
-                            let y = taskbar_rect.top + (taskbar_height - widget_height) / 2;
-                            native_interop::move_window(
-                                hwnd_val,
-                                x,
-                                y,
-                                widget_width,
-                                widget_height,
-                            );
-                        }
+                if let Some((hwnd_val, embedded, x, y, taskbar_top, widget_width, widget_height)) =
+                    move_target
+                {
+                    if embedded {
+                        native_interop::move_window(
+                            hwnd_val,
+                            x,
+                            y - taskbar_top,
+                            widget_width,
+                            widget_height,
+                        );
+                    } else {
+                        native_interop::move_window(hwnd_val, x, y, widget_width, widget_height);
                     }
                 }
             }
             LRESULT(0)
         }
         WM_LBUTTONUP => {
-            let was_dragging = {
+            let mut pt = POINT::default();
+            let _ = GetCursorPos(&mut pt);
+            let drag_result = {
                 let mut state = lock_state();
                 if let Some(s) = state.as_mut() {
                     if s.dragging {
                         s.dragging = false;
-                        let offset = s.tray_offset;
-                        Some(offset)
+                        Some((s.taskbar_index, s.drag_start_client_x))
                     } else {
                         None
                     }
@@ -2225,24 +2471,29 @@ unsafe extern "system" fn wnd_proc(
                     None
                 }
             };
-            if was_dragging.is_some() {
+            if let Some((current_taskbar_index, drag_start_client_x)) = drag_result {
                 let _ = ReleaseCapture();
-                save_state_settings();
-            } else {
-                let switched = {
-                    let mut state = lock_state();
-                    if let Some(s) = state.as_mut() {
-                        cycle_active_provider(s)
-                    } else {
-                        false
+                if let Some((target_index, target_taskbar)) = taskbar_at_point(pt) {
+                    if target_index != current_taskbar_index {
+                        let new_offset = offset_for_drop_point(
+                            target_taskbar.hwnd,
+                            target_taskbar.rect,
+                            pt,
+                            drag_start_client_x,
+                        );
+                        {
+                            let mut state = lock_state();
+                            if let Some(s) = state.as_mut() {
+                                s.tray_offset = new_offset;
+                            }
+                        }
+                        if attach_to_taskbar(hwnd, target_index) {
+                            position_at_taskbar();
+                            render_layered();
+                        }
                     }
-                };
-
-                if switched {
-                    save_state_settings();
-                    render_layered();
-                    schedule_countdown_timer();
                 }
+                save_state_settings();
             }
             LRESULT(0)
         }
@@ -2257,8 +2508,11 @@ unsafe extern "system" fn wnd_proc(
                     {
                         let mut state = lock_state();
                         if let Some(s) = state.as_mut() {
-                            active_provider_state_mut(s).session_text = "...".to_string();
-                            active_provider_state_mut(s).weekly_text = "...".to_string();
+                            s.session_text = "...".to_string();
+                            s.weekly_text = "...".to_string();
+                            s.codex_session_text = "...".to_string();
+                            s.codex_weekly_text = "...".to_string();
+                            s.force_notify_auth_error = true;
                         }
                     }
                     render_layered();
@@ -2283,12 +2537,18 @@ unsafe extern "system" fn wnd_proc(
                     };
 
                     match install_channel {
-                        InstallChannel::Winget => begin_winget_update(hwnd),
+                        InstallChannel::Winget => {
+                            if release.is_some() {
+                                begin_winget_update(hwnd);
+                            } else {
+                                begin_update_check(hwnd, true);
+                            }
+                        }
                         InstallChannel::Portable => {
                             if let Some(release) = release {
                                 begin_update_apply(hwnd, release);
                             } else {
-                                begin_update_check(hwnd);
+                                begin_update_check(hwnd, true);
                             }
                         }
                     }
@@ -2313,375 +2573,8 @@ unsafe extern "system" fn wnd_proc(
                     save_state_settings();
                     position_at_taskbar();
                 }
-                IDM_PROVIDER_CLAUDE | IDM_PROVIDER_CODEX => {
-                    let new_provider = if id == IDM_PROVIDER_CODEX {
-                        ProviderKind::Codex
-                    } else {
-                        ProviderKind::Claude
-                    };
-                    {
-                        let mut state = lock_state();
-                        if let Some(s) = state.as_mut() {
-                            s.active_provider = new_provider;
-                        }
-                    }
-                    save_state_settings();
-                    render_layered();
-                    schedule_countdown_timer();
-                }
                 IDM_START_WITH_WINDOWS => {
                     set_startup_enabled(!is_startup_enabled());
-                }
-                IDM_EXPORT_HISTORY_REPORT => {
-                    let history_sync = {
-                        let state = lock_state();
-                        state.as_ref().map(|s| s.history_sync.clone())
-                    }
-                    .unwrap_or_default();
-                    let token = if history_sync.prefer_remote_reports {
-                        archive_token_from_sources().or_else(|| {
-                            prompt_for_text(
-                                "GitHub Token",
-                                "Personal access token for GitHub report download. It is used for this export only and is not stored.",
-                                "",
-                            )
-                        })
-                    } else {
-                        archive_token_from_sources()
-                    };
-
-                    match history::write_report(&history_sync, token.as_deref()) {
-                        Ok(path) => show_info_message(
-                            hwnd,
-                            "History",
-                            &format!("HTML usage report written to {}", path.display()),
-                        ),
-                        Err(error) => show_error_message(hwnd, "History", &error),
-                    }
-                }
-                IDM_OPEN_APP_DATA_FOLDER => {
-                    if let Err(error) = open_or_create_folder(&app_data_folder_path()) {
-                        show_error_message(hwnd, "History", &error);
-                    }
-                }
-                IDM_OPEN_LOCAL_HISTORY_FOLDER => {
-                    if let Err(error) = open_or_create_folder(&local_history_folder_path()) {
-                        show_error_message(hwnd, "History", &error);
-                    }
-                }
-                IDM_OPEN_REPORTS_FOLDER => {
-                    if let Err(error) = open_or_create_folder(&reports_folder_path()) {
-                        show_error_message(hwnd, "History", &error);
-                    }
-                }
-                IDM_OPEN_CLAUDE_SOURCE_FOLDER => {
-                    match claude_source_folder_path() {
-                        Some(path) => {
-                            if let Err(error) = open_existing_folder(&path) {
-                                show_error_message(hwnd, "History", &error);
-                            }
-                        }
-                        None => show_error_message(
-                            hwnd,
-                            "History",
-                            "Unable to determine the Claude source folder.",
-                        ),
-                    }
-                }
-                IDM_OPEN_CODEX_SOURCE_FOLDER => {
-                    match codex_source_folder_path() {
-                        Some(path) => {
-                            if let Err(error) = open_existing_folder(&path) {
-                                show_error_message(hwnd, "History", &error);
-                            }
-                        }
-                        None => show_error_message(
-                            hwnd,
-                            "History",
-                            "Unable to determine the Codex source folder.",
-                        ),
-                    }
-                }
-                IDM_ARCHIVE_HISTORY_GITHUB => {
-                    let history_sync = {
-                        let state = lock_state();
-                        state.as_ref().map(|s| s.history_sync.clone())
-                    };
-                    let token = archive_token_from_sources().or_else(|| {
-                        prompt_for_text(
-                            "GitHub Token",
-                            "Personal access token for GitHub upload. It is used for this archive operation only and is not stored.",
-                            "",
-                        )
-                    });
-
-                    if let Some(token) = token {
-                        let send_hwnd = SendHwnd::from_hwnd(hwnd);
-                        std::thread::spawn(move || {
-                            let history_sync = history_sync.unwrap_or_default();
-                            match history::archive_history(&history_sync, &token) {
-                                Ok(result) => {
-                                    let mut message = format!(
-                                        "Archived history to {}. Cleaned {} local report(s).",
-                                        result.repo_url, result.cleaned_reports
-                                    );
-                                    if result.uploaded_conversation_files > 0 {
-                                        message.push_str(&format!(
-                                            "\n\nUploaded {} raw conversation log file(s).",
-                                            result.uploaded_conversation_files
-                                        ));
-                                    }
-                                    if let Some(warning) = result.workflow_warning {
-                                        message.push_str(
-                                            "\n\nHistory files were uploaded, but the optional workflow dispatch failed:\n",
-                                        );
-                                        message.push_str(&warning);
-                                    }
-                                    show_info_message(send_hwnd.to_hwnd(), "History", &message)
-                                }
-                                Err(error) => {
-                                    show_error_message(send_hwnd.to_hwnd(), "History", &error)
-                                }
-                            }
-                        });
-                    }
-                }
-                IDM_FETCH_HISTORY_GITHUB => {
-                    let history_sync = {
-                        let state = lock_state();
-                        state.as_ref().map(|s| s.history_sync.clone())
-                    }
-                    .unwrap_or_default();
-                    let token = archive_token_from_sources().or_else(|| {
-                        prompt_for_text(
-                            "GitHub Token",
-                            "Personal access token for GitHub download. It is used for this fetch operation only and is not stored.",
-                            "",
-                        )
-                    });
-
-                    if let Some(token) = token {
-                        let send_hwnd = SendHwnd::from_hwnd(hwnd);
-                        std::thread::spawn(move || {
-                            match history::fetch_history_from_github(&history_sync, &token) {
-                                Ok(result) => show_info_message(
-                                    send_hwnd.to_hwnd(),
-                                    "History",
-                                    &format!(
-                                        "Fetched GitHub history from {}. {}",
-                                        result.repo_url, result.message
-                                    ),
-                                ),
-                                Err(error) => {
-                                    show_error_message(send_hwnd.to_hwnd(), "History", &error)
-                                }
-                            }
-                        });
-                    }
-                }
-                IDM_SET_ARCHIVE_REPO => {
-                    let current_sync = {
-                        let state = lock_state();
-                        state.as_ref().map(|s| s.history_sync.clone())
-                    }
-                    .unwrap_or_default();
-                    let default_value = effective_archive_repo_url(current_sync.repo_url.as_deref());
-                    if let Some(value) = prompt_for_text(
-                        "Archive Repo",
-                        "GitHub repo in owner/repo, https://github.com/owner/repo.git, or git@github.com:owner/repo.git form. Leave blank to use the default archive repo.",
-                        current_sync.repo_url.as_deref().unwrap_or(&default_value),
-                    ) {
-                        let trimmed = value.trim();
-                        {
-                            let mut state = lock_state();
-                            if let Some(s) = state.as_mut() {
-                                s.history_sync.repo_url = if trimmed.is_empty()
-                                    || trimmed.eq_ignore_ascii_case(history::DEFAULT_ARCHIVE_REPO_URL)
-                                {
-                                    None
-                                } else {
-                                    Some(trimmed.to_string())
-                                };
-                            }
-                        }
-                        save_state_settings();
-                    }
-                }
-                IDM_SET_GITHUB_TOKEN => {
-                    if let Some(token) = prompt_for_text(
-                        "GitHub Token",
-                        "GitHub personal access token to save in Windows Credential Manager. It is stored encrypted for this Windows user and not written to settings.json.\n\nClassic tokens start with ghp_ and fine-grained tokens start with github_pat_.",
-                        "",
-                    ) {
-                        if let Err(error) = history::validate_github_token_format(&token) {
-                            show_error_message(hwnd, "GitHub Token", &error);
-                        } else {
-                            let send_hwnd = SendHwnd::from_hwnd(hwnd);
-                            let token_clone = token.clone();
-                            std::thread::spawn(move || {
-                                match history::validate_github_token_live(&token_clone) {
-                                    Ok(username) => {
-                                        match secret_store::save_github_pat(&token_clone) {
-                                            Ok(()) => show_info_message(
-                                                send_hwnd.to_hwnd(),
-                                                "GitHub Token",
-                                                &format!("Token verified (user: {username}) and saved in Windows Credential Manager."),
-                                            ),
-                                            Err(error) => show_error_message(send_hwnd.to_hwnd(), "GitHub Token", &error),
-                                        }
-                                    }
-                                    Err(error) => show_error_message(
-                                        send_hwnd.to_hwnd(),
-                                        "GitHub Token",
-                                        &format!("Token validation failed: {error}"),
-                                    ),
-                                }
-                            });
-                        }
-                    }
-                }
-                IDM_CLEAR_GITHUB_TOKEN => match secret_store::clear_github_pat() {
-                    Ok(()) => show_info_message(
-                        hwnd,
-                        "GitHub Token",
-                        "Removed saved GitHub token from Windows Credential Manager.",
-                    ),
-                    Err(error) => show_error_message(hwnd, "GitHub Token", &error),
-                },
-                IDM_INSTALL_WORKFLOW_GITHUB => {
-                    let history_sync = {
-                        let state = lock_state();
-                        state.as_ref().map(|s| s.history_sync.clone())
-                    }
-                    .unwrap_or_default();
-                    let token = archive_token_from_sources().or_else(|| {
-                        prompt_for_text(
-                            "GitHub Token",
-                            "Personal access token for workflow installation. It is used only for this upload and is not stored. Modifying .github/workflows requires workflow-related GitHub token permissions.",
-                            "",
-                        )
-                    });
-
-                    if let Some(token) = token {
-                        let send_hwnd = SendHwnd::from_hwnd(hwnd);
-                        std::thread::spawn(move || {
-                            match history::install_sample_workflow_to_github(&history_sync, &token) {
-                                Ok(result) => show_info_message(
-                                    send_hwnd.to_hwnd(),
-                                    "History",
-                                    &format!(
-                                        "Installed sample workflow to {}",
-                                        result.location
-                                    ),
-                                ),
-                                Err(error) => {
-                                    show_error_message(send_hwnd.to_hwnd(), "History", &error)
-                                }
-                            }
-                        });
-                    }
-                }
-                IDM_INSTALL_WORKFLOW_LOCAL => {
-                    let current_sync = {
-                        let state = lock_state();
-                        state.as_ref().map(|s| s.history_sync.clone())
-                    }
-                    .unwrap_or_default();
-                    if let Some(local_repo_path) = resolve_local_repo_path(&current_sync) {
-                        match history::install_sample_workflow_to_local_repo(
-                            std::path::Path::new(&local_repo_path),
-                            current_sync.workflow_file.as_deref(),
-                        ) {
-                            Ok(workflow_path) => {
-                                {
-                                    let mut state = lock_state();
-                                    if let Some(s) = state.as_mut() {
-                                        s.history_sync.local_repo_path = Some(local_repo_path);
-                                    }
-                                }
-                                save_state_settings();
-                                show_info_message(
-                                    hwnd,
-                                    "History",
-                                    &format!(
-                                        "Installed sample workflow locally at {}",
-                                        workflow_path.display()
-                                    ),
-                                );
-                            }
-                            Err(error) => show_error_message(hwnd, "History", &error),
-                        }
-                    }
-                }
-                IDM_OPEN_LOCAL_WORKFLOWS => {
-                    let current_sync = {
-                        let state = lock_state();
-                        state.as_ref().map(|s| s.history_sync.clone())
-                    }
-                    .unwrap_or_default();
-                    if let Some(local_repo_path) = resolve_local_repo_path(&current_sync) {
-                        match history::local_workflows_dir(std::path::Path::new(&local_repo_path)) {
-                            Ok(workflows_dir) => {
-                                if let Err(error) = std::fs::create_dir_all(&workflows_dir) {
-                                    show_error_message(
-                                        hwnd,
-                                        "History",
-                                        &format!(
-                                            "Unable to create local workflows directory {}: {error}",
-                                            workflows_dir.display()
-                                        ),
-                                    );
-                                } else if let Err(error) = open_in_explorer(&workflows_dir) {
-                                    show_error_message(hwnd, "History", &error);
-                                } else {
-                                    {
-                                        let mut state = lock_state();
-                                        if let Some(s) = state.as_mut() {
-                                            s.history_sync.local_repo_path = Some(local_repo_path);
-                                        }
-                                    }
-                                    save_state_settings();
-                                }
-                            }
-                            Err(error) => show_error_message(hwnd, "History", &error),
-                        }
-                    }
-                }
-                IDM_SETUP_HISTORY_SYNC => {
-                    let current_sync = {
-                        let state = lock_state();
-                        state.as_ref().map(|s| s.history_sync.clone())
-                    }
-                    .unwrap_or_default();
-                    if let Some(new_sync) = run_sync_setup(hwnd, &current_sync) {
-                        {
-                            let mut state = lock_state();
-                            if let Some(s) = state.as_mut() {
-                                s.history_sync = new_sync;
-                            }
-                        }
-                        save_state_settings();
-                    }
-                }
-                IDM_TOGGLE_CONVERSATION_SYNC => {
-                    let enabled = {
-                        let mut state = lock_state();
-                        if let Some(s) = state.as_mut() {
-                            s.history_sync.upload_conversations =
-                                !s.history_sync.upload_conversations;
-                            s.history_sync.upload_conversations
-                        } else {
-                            false
-                        }
-                    };
-                    save_state_settings();
-                    if enabled {
-                        show_info_message(
-                            hwnd,
-                            "GitHub Sync",
-                            "Raw conversation syncing is enabled. Push To GitHub will upload .claude and .codex session logs to the configured archive repo.",
-                        );
-                    }
                 }
                 IDM_FREQ_1MIN | IDM_FREQ_5MIN | IDM_FREQ_15MIN | IDM_FREQ_1HOUR => {
                     let new_interval = match id {
@@ -2701,15 +2594,68 @@ unsafe extern "system" fn wnd_proc(
                     // Reset the poll timer with the new interval
                     SetTimer(hwnd, TIMER_POLL, new_interval, None);
                 }
-                IDM_LANG_SYSTEM | IDM_LANG_ENGLISH | IDM_LANG_SPANISH | IDM_LANG_FRENCH
-                | IDM_LANG_GERMAN | IDM_LANG_JAPANESE => {
+                IDM_MODEL_CLAUDE_CODE | IDM_MODEL_CODEX | IDM_MODEL_ANTIGRAVITY => {
+                    {
+                        let mut state = lock_state();
+                        if let Some(s) = state.as_mut() {
+                            match id {
+                                IDM_MODEL_CLAUDE_CODE => {
+                                    if s.show_codex || s.show_antigravity || !s.show_claude_code {
+                                        s.show_claude_code = !s.show_claude_code;
+                                    }
+                                }
+                                IDM_MODEL_CODEX => {
+                                    if s.show_claude_code || s.show_antigravity || !s.show_codex {
+                                        s.show_codex = !s.show_codex;
+                                    }
+                                }
+                                IDM_MODEL_ANTIGRAVITY => {
+                                    if s.show_claude_code || s.show_codex || !s.show_antigravity {
+                                        s.show_antigravity = !s.show_antigravity;
+                                    }
+                                }
+                                _ => {}
+                            }
+                            s.session_text = "...".to_string();
+                            s.weekly_text = "...".to_string();
+                            s.codex_session_text = "...".to_string();
+                            s.codex_weekly_text = "...".to_string();
+                            s.antigravity_session_text = "...".to_string();
+                            s.antigravity_weekly_text = "...".to_string();
+                        }
+                    }
+                    save_state_settings();
+                    position_at_taskbar();
+                    render_layered();
+                    sync_tray_icons(hwnd);
+                    let sh = SendHwnd::from_hwnd(hwnd);
+                    std::thread::spawn(move || {
+                        do_poll(sh);
+                    });
+                }
+                IDM_LANG_SYSTEM
+                | IDM_LANG_ENGLISH
+                | IDM_LANG_DUTCH
+                | IDM_LANG_SPANISH
+                | IDM_LANG_FRENCH
+                | IDM_LANG_GERMAN
+                | IDM_LANG_JAPANESE
+                | IDM_LANG_KOREAN
+                | IDM_LANG_TRADITIONAL_CHINESE
+                | IDM_LANG_RUSSIAN
+                | IDM_LANG_PORTUGUESE_BRAZIL => {
                     let language_override = match id {
                         IDM_LANG_SYSTEM => None,
                         IDM_LANG_ENGLISH => Some(LanguageId::English),
+                        IDM_LANG_DUTCH => Some(LanguageId::Dutch),
                         IDM_LANG_SPANISH => Some(LanguageId::Spanish),
                         IDM_LANG_FRENCH => Some(LanguageId::French),
                         IDM_LANG_GERMAN => Some(LanguageId::German),
                         IDM_LANG_JAPANESE => Some(LanguageId::Japanese),
+                        IDM_LANG_KOREAN => Some(LanguageId::Korean),
+                        IDM_LANG_TRADITIONAL_CHINESE => Some(LanguageId::TraditionalChinese),
+                        IDM_LANG_RUSSIAN => Some(LanguageId::Russian),
+                        IDM_LANG_PORTUGUESE_BRAZIL => Some(LanguageId::PortugueseBrazil),
                         _ => None,
                     };
                     {
@@ -2721,7 +2667,22 @@ unsafe extern "system" fn wnd_proc(
                     save_state_settings();
                     render_layered();
                 }
+                id if id == tray_icon::IDM_TOGGLE_WIDGET => {
+                    toggle_widget_visibility(hwnd);
+                }
                 _ => {}
+            }
+            LRESULT(0)
+        }
+        _ if msg == WM_APP_TRAY => {
+            match tray_icon::handle_message(lparam) {
+                tray_icon::TrayAction::ToggleWidget => {
+                    toggle_widget_visibility(hwnd);
+                }
+                tray_icon::TrayAction::ShowContextMenu => {
+                    show_context_menu(hwnd);
+                }
+                tray_icon::TrayAction::None => {}
             }
             LRESULT(0)
         }
@@ -2733,6 +2694,7 @@ unsafe extern "system" fn wnd_proc(
             if let Some(h) = hook {
                 native_interop::unhook_win_event(h);
             }
+            tray_icon::remove_all(hwnd);
             PostQuitMessage(0);
             LRESULT(0)
         }
@@ -2749,10 +2711,10 @@ fn show_context_menu(hwnd: HWND) {
             language_override,
             install_channel,
             update_status,
-            active_provider,
-            history_sync,
-            claude_state,
-            codex_state,
+            widget_visible,
+            show_claude_code,
+            show_codex,
+            show_antigravity,
         ) = {
             let state = lock_state();
             match state.as_ref() {
@@ -2763,10 +2725,10 @@ fn show_context_menu(hwnd: HWND) {
                     s.language_override,
                     s.install_channel,
                     s.update_status.clone(),
-                    s.active_provider,
-                    s.history_sync.clone(),
-                    s.claude.clone(),
-                    s.codex.clone(),
+                    s.widget_visible,
+                    s.show_claude_code,
+                    s.show_codex,
+                    s.show_antigravity,
                 ),
                 None => (
                     POLL_15_MIN,
@@ -2775,10 +2737,10 @@ fn show_context_menu(hwnd: HWND) {
                     None,
                     InstallChannel::Portable,
                     UpdateStatus::Idle,
-                    ProviderKind::Claude,
-                    HistorySyncSettings::default(),
-                    ProviderState::default(),
-                    ProviderState::default(),
+                    true,
+                    true,
+                    false,
+                    false,
                 ),
             }
         };
@@ -2792,230 +2754,6 @@ fn show_context_menu(hwnd: HWND) {
             1,
             PCWSTR::from_raw(refresh_str.as_ptr()),
         );
-
-        let providers_menu = CreatePopupMenu().unwrap();
-        for (provider, id) in [
-            (ProviderKind::Claude, IDM_PROVIDER_CLAUDE),
-            (ProviderKind::Codex, IDM_PROVIDER_CODEX),
-        ] {
-            let label = native_interop::wide_str(provider_name(provider));
-            let flags = if active_provider == provider {
-                MF_CHECKED
-            } else {
-                MENU_ITEM_FLAGS(0)
-            };
-            let _ = AppendMenuW(
-                providers_menu,
-                flags,
-                id as usize,
-                PCWSTR::from_raw(label.as_ptr()),
-            );
-        }
-
-        let providers_label = native_interop::wide_str("Providers");
-        let _ = AppendMenuW(
-            menu,
-            MF_POPUP,
-            providers_menu.0 as usize,
-            PCWSTR::from_raw(providers_label.as_ptr()),
-        );
-
-        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-        append_disabled_menu_line(menu, &provider_summary_line(ProviderKind::Claude, &claude_state));
-        append_disabled_menu_line(menu, &provider_summary_line(ProviderKind::Codex, &codex_state));
-        if let Some(data) = claude_state.data.as_ref() {
-            append_disabled_menu_line(menu, &provider_raw_usage_line(ProviderKind::Claude, data));
-        }
-        if let Some(data) = codex_state.data.as_ref() {
-            append_disabled_menu_line(menu, &provider_raw_usage_line(ProviderKind::Codex, data));
-        }
-
-        if let Some(data) = codex_state.data.as_ref() {
-            if let Some(plan) = data.plan_name.as_deref().filter(|value| !value.is_empty()) {
-                append_disabled_menu_line(menu, &format!("Codex plan: {plan}"));
-            }
-
-            if let Some(source) = data.source_label.as_deref().filter(|value| !value.is_empty()) {
-                append_disabled_menu_line(menu, &format!("Codex source: {source}"));
-            }
-
-            if let Some(updated_at) = data.updated_at {
-                append_disabled_menu_line(
-                    menu,
-                    &format!("Codex updated: {}", relative_time_text(updated_at)),
-                );
-            }
-
-            if let Some(review) = data.review.as_ref() {
-                append_disabled_menu_line(
-                    menu,
-                    &format!("Code review: {}", poller::format_line(review, strings)),
-                );
-            }
-
-            if let Some(credits) = credits_text(data) {
-                append_disabled_menu_line(menu, &credits);
-            }
-        }
-
-        if let Some(activity) = codex_state.activity.as_ref() {
-            for line in activity_lines(activity) {
-                append_disabled_menu_line(menu, &line);
-            }
-        }
-
-        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-
-        let history_menu = CreatePopupMenu().unwrap();
-        let open_app_data_str = native_interop::wide_str("Open App Data Folder");
-        let _ = AppendMenuW(
-            history_menu,
-            MENU_ITEM_FLAGS(0),
-            IDM_OPEN_APP_DATA_FOLDER as usize,
-            PCWSTR::from_raw(open_app_data_str.as_ptr()),
-        );
-        let open_local_history_str = native_interop::wide_str("Open Local History Folder");
-        let _ = AppendMenuW(
-            history_menu,
-            MENU_ITEM_FLAGS(0),
-            IDM_OPEN_LOCAL_HISTORY_FOLDER as usize,
-            PCWSTR::from_raw(open_local_history_str.as_ptr()),
-        );
-        let open_reports_str = native_interop::wide_str("Open Reports Folder");
-        let _ = AppendMenuW(
-            history_menu,
-            MENU_ITEM_FLAGS(0),
-            IDM_OPEN_REPORTS_FOLDER as usize,
-            PCWSTR::from_raw(open_reports_str.as_ptr()),
-        );
-        let open_claude_source_str = native_interop::wide_str("Open Claude Source Folder");
-        let _ = AppendMenuW(
-            history_menu,
-            MENU_ITEM_FLAGS(0),
-            IDM_OPEN_CLAUDE_SOURCE_FOLDER as usize,
-            PCWSTR::from_raw(open_claude_source_str.as_ptr()),
-        );
-        let open_codex_source_str = native_interop::wide_str("Open Codex Source Folder");
-        let _ = AppendMenuW(
-            history_menu,
-            MENU_ITEM_FLAGS(0),
-            IDM_OPEN_CODEX_SOURCE_FOLDER as usize,
-            PCWSTR::from_raw(open_codex_source_str.as_ptr()),
-        );
-        let _ = AppendMenuW(history_menu, MF_SEPARATOR, 0, PCWSTR::null());
-        let export_history_str = native_interop::wide_str("Export HTML Report");
-        let _ = AppendMenuW(
-            history_menu,
-            MENU_ITEM_FLAGS(0),
-            IDM_EXPORT_HISTORY_REPORT as usize,
-            PCWSTR::from_raw(export_history_str.as_ptr()),
-        );
-        let _ = AppendMenuW(history_menu, MF_SEPARATOR, 0, PCWSTR::null());
-
-        let sync_menu = CreatePopupMenu().unwrap();
-        append_disabled_menu_line(sync_menu, &archive_repo_line(&history_sync));
-        append_disabled_menu_line(sync_menu, &archive_branch_line(&history_sync));
-        append_disabled_menu_line(sync_menu, &local_repo_line(&history_sync));
-        append_disabled_menu_line(sync_menu, &github_token_line());
-        append_disabled_menu_line(sync_menu, &sync_mode_line(&history_sync));
-        append_disabled_menu_line(sync_menu, &sync_scopes_line(&history_sync));
-        append_disabled_menu_line(sync_menu, &sync_report_source_line(&history_sync));
-        let _ = AppendMenuW(sync_menu, MF_SEPARATOR, 0, PCWSTR::null());
-
-        let setup_sync_str = native_interop::wide_str("Setup...");
-        let _ = AppendMenuW(
-            sync_menu,
-            MENU_ITEM_FLAGS(0),
-            IDM_SETUP_HISTORY_SYNC as usize,
-            PCWSTR::from_raw(setup_sync_str.as_ptr()),
-        );
-        let sync_conversations_str = native_interop::wide_str("Sync Raw Conversations");
-        let _ = AppendMenuW(
-            sync_menu,
-            if history_sync.upload_conversations {
-                MF_CHECKED
-            } else {
-                MENU_ITEM_FLAGS(0)
-            },
-            IDM_TOGGLE_CONVERSATION_SYNC as usize,
-            PCWSTR::from_raw(sync_conversations_str.as_ptr()),
-        );
-        let archive_repo_str = native_interop::wide_str("Set Repo...");
-        let _ = AppendMenuW(
-            sync_menu,
-            MENU_ITEM_FLAGS(0),
-            IDM_SET_ARCHIVE_REPO as usize,
-            PCWSTR::from_raw(archive_repo_str.as_ptr()),
-        );
-        let set_github_token_str = native_interop::wide_str("Set Saved Token...");
-        let _ = AppendMenuW(
-            sync_menu,
-            MENU_ITEM_FLAGS(0),
-            IDM_SET_GITHUB_TOKEN as usize,
-            PCWSTR::from_raw(set_github_token_str.as_ptr()),
-        );
-        let clear_github_token_str = native_interop::wide_str("Clear Saved Token");
-        let _ = AppendMenuW(
-            sync_menu,
-            MENU_ITEM_FLAGS(0),
-            IDM_CLEAR_GITHUB_TOKEN as usize,
-            PCWSTR::from_raw(clear_github_token_str.as_ptr()),
-        );
-        let _ = AppendMenuW(sync_menu, MF_SEPARATOR, 0, PCWSTR::null());
-        let archive_history_str = native_interop::wide_str("Push To GitHub");
-        let _ = AppendMenuW(
-            sync_menu,
-            MENU_ITEM_FLAGS(0),
-            IDM_ARCHIVE_HISTORY_GITHUB as usize,
-            PCWSTR::from_raw(archive_history_str.as_ptr()),
-        );
-        let fetch_history_str = native_interop::wide_str("Pull From GitHub");
-        let _ = AppendMenuW(
-            sync_menu,
-            MENU_ITEM_FLAGS(0),
-            IDM_FETCH_HISTORY_GITHUB as usize,
-            PCWSTR::from_raw(fetch_history_str.as_ptr()),
-        );
-        let _ = AppendMenuW(sync_menu, MF_SEPARATOR, 0, PCWSTR::null());
-        let install_workflow_github_str = native_interop::wide_str("Install Workflow To GitHub");
-        let _ = AppendMenuW(
-            sync_menu,
-            MENU_ITEM_FLAGS(0),
-            IDM_INSTALL_WORKFLOW_GITHUB as usize,
-            PCWSTR::from_raw(install_workflow_github_str.as_ptr()),
-        );
-        let install_workflow_local_str = native_interop::wide_str("Install Workflow Locally");
-        let _ = AppendMenuW(
-            sync_menu,
-            MENU_ITEM_FLAGS(0),
-            IDM_INSTALL_WORKFLOW_LOCAL as usize,
-            PCWSTR::from_raw(install_workflow_local_str.as_ptr()),
-        );
-        let open_local_workflows_str = native_interop::wide_str("Open Local Workflows Folder");
-        let _ = AppendMenuW(
-            sync_menu,
-            MENU_ITEM_FLAGS(0),
-            IDM_OPEN_LOCAL_WORKFLOWS as usize,
-            PCWSTR::from_raw(open_local_workflows_str.as_ptr()),
-        );
-
-        let sync_label = native_interop::wide_str("GitHub Sync");
-        let _ = AppendMenuW(
-            history_menu,
-            MF_POPUP,
-            sync_menu.0 as usize,
-            PCWSTR::from_raw(sync_label.as_ptr()),
-        );
-
-        let history_label = native_interop::wide_str("History");
-        let _ = AppendMenuW(
-            menu,
-            MF_POPUP,
-            history_menu.0 as usize,
-            PCWSTR::from_raw(history_label.as_ptr()),
-        );
-
-        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
 
         // Update Frequency submenu
         let freq_menu = CreatePopupMenu().unwrap();
@@ -3046,6 +2784,55 @@ fn show_context_menu(hwnd: HWND) {
             MF_POPUP,
             freq_menu.0 as usize,
             PCWSTR::from_raw(freq_label.as_ptr()),
+        );
+
+        // Models submenu
+        let models_menu = CreatePopupMenu().unwrap();
+        let claude_model = native_interop::wide_str(strings.claude_code_model);
+        let claude_flags = if show_claude_code {
+            MF_CHECKED
+        } else {
+            MENU_ITEM_FLAGS(0)
+        };
+        let _ = AppendMenuW(
+            models_menu,
+            claude_flags,
+            IDM_MODEL_CLAUDE_CODE as usize,
+            PCWSTR::from_raw(claude_model.as_ptr()),
+        );
+
+        let codex_model = native_interop::wide_str(strings.codex_model);
+        let codex_flags = if show_codex {
+            MF_CHECKED
+        } else {
+            MENU_ITEM_FLAGS(0)
+        };
+        let _ = AppendMenuW(
+            models_menu,
+            codex_flags,
+            IDM_MODEL_CODEX as usize,
+            PCWSTR::from_raw(codex_model.as_ptr()),
+        );
+
+        let antigravity_model = native_interop::wide_str(strings.antigravity_model);
+        let antigravity_flags = if show_antigravity {
+            MF_CHECKED
+        } else {
+            MENU_ITEM_FLAGS(0)
+        };
+        let _ = AppendMenuW(
+            models_menu,
+            antigravity_flags,
+            IDM_MODEL_ANTIGRAVITY as usize,
+            PCWSTR::from_raw(antigravity_model.as_ptr()),
+        );
+
+        let models_label = native_interop::wide_str(strings.models);
+        let _ = AppendMenuW(
+            menu,
+            MF_POPUP,
+            models_menu.0 as usize,
+            PCWSTR::from_raw(models_label.as_ptr()),
         );
 
         // Settings submenu
@@ -3089,10 +2876,15 @@ fn show_context_menu(hwnd: HWND) {
         for language in LanguageId::ALL {
             let id = match language {
                 LanguageId::English => IDM_LANG_ENGLISH,
+                LanguageId::Dutch => IDM_LANG_DUTCH,
                 LanguageId::Spanish => IDM_LANG_SPANISH,
                 LanguageId::French => IDM_LANG_FRENCH,
                 LanguageId::German => IDM_LANG_GERMAN,
                 LanguageId::Japanese => IDM_LANG_JAPANESE,
+                LanguageId::Korean => IDM_LANG_KOREAN,
+                LanguageId::TraditionalChinese => IDM_LANG_TRADITIONAL_CHINESE,
+                LanguageId::Russian => IDM_LANG_RUSSIAN,
+                LanguageId::PortugueseBrazil => IDM_LANG_PORTUGUESE_BRAZIL,
             };
             let label_str = native_interop::wide_str(language.native_name());
             let flags = if language_override == Some(language) {
@@ -3121,11 +2913,10 @@ fn show_context_menu(hwnd: HWND) {
         let version_label =
             version_action_label(strings, language, install_channel, &update_status);
         let version_str = native_interop::wide_str(&version_label);
-        let version_flags = if install_channel == InstallChannel::Portable
-            && matches!(
-                update_status,
-                UpdateStatus::Checking | UpdateStatus::Applying
-            ) {
+        let version_flags = if matches!(
+            update_status,
+            UpdateStatus::Checking | UpdateStatus::Applying
+        ) {
             MF_GRAYED
         } else {
             MENU_ITEM_FLAGS(0)
@@ -3143,6 +2934,19 @@ fn show_context_menu(hwnd: HWND) {
             MF_POPUP,
             settings_menu.0 as usize,
             PCWSTR::from_raw(settings_label.as_ptr()),
+        );
+
+        let widget_label = native_interop::wide_str(strings.show_widget);
+        let widget_flags = if widget_visible {
+            MF_CHECKED
+        } else {
+            MENU_ITEM_FLAGS(0)
+        };
+        let _ = AppendMenuW(
+            menu,
+            widget_flags,
+            tray_icon::IDM_TOGGLE_WIDGET as usize,
+            PCWSTR::from_raw(widget_label.as_ptr()),
         );
 
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
@@ -3168,28 +2972,50 @@ fn paint(hdc: HDC, hwnd: HWND) {
     let (
         is_dark,
         strings,
-        active_provider,
         session_pct,
         session_text,
         weekly_pct,
         weekly_text,
+        codex_session_pct,
+        codex_session_text,
+        codex_weekly_pct,
+        codex_weekly_text,
+        antigravity_session_pct,
+        antigravity_session_text,
+        antigravity_weekly_pct,
+        antigravity_weekly_text,
+        show_claude_code,
+        show_codex,
+        show_antigravity,
     ) = {
         let state = lock_state();
         match state.as_ref() {
             Some(s) => (
                 s.is_dark,
                 s.language.strings(),
-                s.active_provider,
-                active_provider_state(s).session_percent,
-                active_provider_state(s).session_text.clone(),
-                active_provider_state(s).weekly_percent,
-                active_provider_state(s).weekly_text.clone(),
+                s.session_percent,
+                s.session_text.clone(),
+                s.weekly_percent,
+                s.weekly_text.clone(),
+                s.codex_session_percent,
+                s.codex_session_text.clone(),
+                s.codex_weekly_percent,
+                s.codex_weekly_text.clone(),
+                s.antigravity_session_percent,
+                s.antigravity_session_text.clone(),
+                s.antigravity_weekly_percent,
+                s.antigravity_weekly_text.clone(),
+                s.show_claude_code,
+                s.show_codex,
+                s.show_antigravity,
             ),
             None => return,
         }
     };
 
-    let accent = provider_accent(active_provider);
+    let accent = claude_accent_color();
+    let codex_accent = codex_accent_color(is_dark);
+    let antigravity_accent = antigravity_accent_color();
     let track = if is_dark {
         Color::from_hex("#444444")
     } else {
@@ -3230,11 +3056,23 @@ fn paint(hdc: HDC, hwnd: HWND) {
             &accent,
             &track,
             strings,
-            active_provider,
             session_pct,
             &session_text,
             weekly_pct,
             &weekly_text,
+            codex_session_pct,
+            &codex_session_text,
+            codex_weekly_pct,
+            &codex_weekly_text,
+            antigravity_session_pct,
+            &antigravity_session_text,
+            antigravity_weekly_pct,
+            &antigravity_weekly_text,
+            show_claude_code,
+            show_codex,
+            show_antigravity,
+            &codex_accent,
+            &antigravity_accent,
         );
 
         let _ = BitBlt(hdc, 0, 0, width, height, mem_dc, 0, 0, SRCCOPY);
@@ -3249,18 +3087,45 @@ fn draw_row(
     hdc: HDC,
     x: i32,
     y: i32,
+    is_dark: bool,
+    text_color: &Color,
     label: &str,
-    percent: f64,
-    text: &str,
-    accent: &Color,
+    claude_percent: f64,
+    claude_text: &str,
+    codex_percent: f64,
+    codex_text: &str,
+    antigravity_percent: f64,
+    antigravity_text: &str,
+    show_claude_code: bool,
+    show_codex: bool,
+    show_antigravity: bool,
+    claude_accent: &Color,
+    codex_accent: &Color,
+    antigravity_accent: &Color,
     track: &Color,
 ) {
-    let seg_w = sc(SEGMENT_W);
     let seg_h = sc(SEGMENT_H);
-    let seg_gap = sc(SEGMENT_GAP);
-    let corner_r = sc(CORNER_RADIUS);
+    let active_models = active_model_count(show_claude_code, show_codex, show_antigravity);
+    let segment_count = row_bar_segment_count(active_models);
+    let use_model_text_colors = active_models > 1;
+    let claude_value_color = if use_model_text_colors {
+        claude_usage_text_color(is_dark)
+    } else {
+        *text_color
+    };
+    let codex_value_color = if use_model_text_colors {
+        codex_usage_text_color(is_dark)
+    } else {
+        *text_color
+    };
+    let antigravity_value_color = if use_model_text_colors {
+        antigravity_usage_text_color(is_dark)
+    } else {
+        *text_color
+    };
 
     unsafe {
+        let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
         let mut label_wide: Vec<u16> = label.encode_utf16().collect();
         let mut label_rect = RECT {
             left: x,
@@ -3275,13 +3140,81 @@ fn draw_row(
             DT_LEFT | DT_VCENTER | DT_SINGLELINE,
         );
 
-        let bar_x = x + sc(LABEL_WIDTH) + sc(LABEL_RIGHT_MARGIN);
-        let percent_clamped = percent.clamp(0.0, 100.0);
+        let mut model_x = x + sc(LABEL_WIDTH) + sc(LABEL_RIGHT_MARGIN);
+        if show_claude_code {
+            draw_usage_bar(
+                hdc,
+                model_x,
+                y,
+                segment_count,
+                claude_percent,
+                claude_text,
+                claude_accent,
+                track,
+                &claude_value_color,
+            );
+            model_x += model_usage_width(segment_count) + sc(MODEL_RIGHT_MARGIN);
+        }
+        if show_codex {
+            draw_usage_bar(
+                hdc,
+                model_x,
+                y,
+                segment_count,
+                codex_percent,
+                codex_text,
+                codex_accent,
+                track,
+                &codex_value_color,
+            );
+            model_x += model_usage_width(segment_count) + sc(MODEL_RIGHT_MARGIN);
+        }
+        if show_antigravity {
+            draw_usage_bar(
+                hdc,
+                model_x,
+                y,
+                segment_count,
+                antigravity_percent,
+                antigravity_text,
+                antigravity_accent,
+                track,
+                &antigravity_value_color,
+            );
+        }
+    }
+}
 
-        for i in 0..SEGMENT_COUNT {
+fn model_usage_width(segment_count: i32) -> i32 {
+    (sc(SEGMENT_W) + sc(SEGMENT_GAP)) * segment_count - sc(SEGMENT_GAP)
+        + sc(BAR_RIGHT_MARGIN)
+        + sc(TEXT_WIDTH)
+}
+
+fn draw_usage_bar(
+    hdc: HDC,
+    bar_x: i32,
+    y: i32,
+    segment_count: i32,
+    percent: f64,
+    text: &str,
+    accent: &Color,
+    track: &Color,
+    text_color: &Color,
+) {
+    let seg_w = sc(SEGMENT_W);
+    let seg_h = sc(SEGMENT_H);
+    let seg_gap = sc(SEGMENT_GAP);
+    let corner_r = sc(CORNER_RADIUS);
+
+    unsafe {
+        let percent_clamped = percent.clamp(0.0, 100.0);
+        let segment_percent = 100.0 / segment_count as f64;
+
+        for i in 0..segment_count {
             let seg_x = bar_x + i * (seg_w + seg_gap);
-            let seg_start = (i as f64) * 10.0;
-            let seg_end = seg_start + 10.0;
+            let seg_start = (i as f64) * segment_percent;
+            let seg_end = seg_start + segment_percent;
 
             let seg_rect = RECT {
                 left: seg_x,
@@ -3296,7 +3229,7 @@ fn draw_row(
                 draw_rounded_rect(hdc, &seg_rect, track, corner_r);
             } else {
                 draw_rounded_rect(hdc, &seg_rect, track, corner_r);
-                let fraction = (percent_clamped - seg_start) / 10.0;
+                let fraction = (percent_clamped - seg_start) / segment_percent;
                 let fill_width = (seg_w as f64 * fraction) as i32;
                 if fill_width > 0 {
                     let fill_rect = RECT {
@@ -3323,7 +3256,7 @@ fn draw_row(
             }
         }
 
-        let text_x = bar_x + SEGMENT_COUNT * (seg_w + seg_gap) - seg_gap + sc(BAR_RIGHT_MARGIN);
+        let text_x = bar_x + segment_count * (seg_w + seg_gap) - seg_gap + sc(BAR_RIGHT_MARGIN);
         let mut text_wide: Vec<u16> = text.encode_utf16().collect();
         let mut text_rect = RECT {
             left: text_x,
@@ -3331,62 +3264,13 @@ fn draw_row(
             right: text_x + sc(TEXT_WIDTH),
             bottom: y + seg_h,
         };
+        let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
         let _ = DrawTextW(
             hdc,
             &mut text_wide,
             &mut text_rect,
             DT_LEFT | DT_VCENTER | DT_SINGLELINE,
         );
-    }
-}
-
-fn draw_provider_badge(hdc: HDC, rect: &RECT, provider: ProviderKind, accent: &Color) {
-    let _ = accent;
-    let (fill, border, text) = provider_badge_palette(provider);
-    draw_rounded_rect(hdc, rect, &border, sc(4));
-
-    let inner = RECT {
-        left: rect.left + sc(1),
-        top: rect.top + sc(1),
-        right: rect.right - sc(1),
-        bottom: rect.bottom - sc(1),
-    };
-    draw_rounded_rect(hdc, &inner, &fill, sc(3));
-
-    unsafe {
-        let font_name = native_interop::wide_str("Segoe UI");
-        let font = CreateFontW(
-            sc(-12),
-            0,
-            0,
-            0,
-            FW_SEMIBOLD.0 as i32,
-            0,
-            0,
-            0,
-            DEFAULT_CHARSET.0 as u32,
-            OUT_TT_PRECIS.0 as u32,
-            CLIP_DEFAULT_PRECIS.0 as u32,
-            CLEARTYPE_QUALITY.0 as u32,
-            (DEFAULT_PITCH.0 | FF_DONTCARE.0) as u32,
-            PCWSTR::from_raw(font_name.as_ptr()),
-        );
-        let old_font = SelectObject(hdc, font);
-        let old_bk_mode = SetBkMode(hdc, TRANSPARENT);
-        let _ = SetTextColor(hdc, COLORREF(text.to_colorref()));
-
-        let mut text: Vec<u16> = provider.short_label().encode_utf16().collect();
-        let mut text_rect = inner;
-        let _ = DrawTextW(
-            hdc,
-            &mut text,
-            &mut text_rect,
-            DT_CENTER | DT_VCENTER | DT_SINGLELINE,
-        );
-
-        SelectObject(hdc, old_font);
-        let _ = SetBkMode(hdc, BACKGROUND_MODE(old_bk_mode as u32));
-        let _ = DeleteObject(font);
     }
 }
 

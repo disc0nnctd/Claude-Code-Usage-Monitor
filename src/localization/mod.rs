@@ -1,8 +1,13 @@
+mod dutch;
 mod english;
 mod french;
 mod german;
 mod japanese;
+mod korean;
+mod portuguese_brazil;
+mod russian;
 mod spanish;
+mod traditional_chinese;
 
 use windows::core::PWSTR;
 use windows::Win32::Globalization::{
@@ -13,58 +18,88 @@ use windows::Win32::Globalization::{
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LanguageId {
     English,
+    Dutch,
     Spanish,
     French,
     German,
     Japanese,
+    Korean,
+    TraditionalChinese,
+    Russian,
+    PortugueseBrazil,
 }
 
 impl LanguageId {
-    pub const ALL: [LanguageId; 5] = [
+    pub const ALL: [LanguageId; 10] = [
         LanguageId::English,
+        LanguageId::Dutch,
         LanguageId::Spanish,
         LanguageId::French,
         LanguageId::German,
         LanguageId::Japanese,
+        LanguageId::Korean,
+        LanguageId::TraditionalChinese,
+        LanguageId::Russian,
+        LanguageId::PortugueseBrazil,
     ];
 
     pub fn code(self) -> &'static str {
         match self {
             Self::English => "en",
+            Self::Dutch => "nl",
             Self::Spanish => "es",
             Self::French => "fr",
             Self::German => "de",
             Self::Japanese => "ja",
+            Self::Korean => "ko",
+            Self::TraditionalChinese => "zh-TW",
+            Self::Russian => "ru",
+            Self::PortugueseBrazil => "pt-BR",
         }
     }
 
     pub fn native_name(self) -> &'static str {
         match self {
             Self::English => "English",
+            Self::Dutch => "Nederlands",
             Self::Spanish => "Español",
             Self::French => "Français",
             Self::German => "Deutsch",
             Self::Japanese => "日本語",
+            Self::Korean => "한국어",
+            Self::TraditionalChinese => "繁體中文",
+            Self::Russian => "Русский",
+            Self::PortugueseBrazil => "Português (Brasil)",
         }
     }
 
     pub fn strings(self) -> Strings {
         match self {
             Self::English => english::STRINGS,
+            Self::Dutch => dutch::STRINGS,
             Self::Spanish => spanish::STRINGS,
             Self::French => french::STRINGS,
             Self::German => german::STRINGS,
             Self::Japanese => japanese::STRINGS,
+            Self::Korean => korean::STRINGS,
+            Self::TraditionalChinese => traditional_chinese::STRINGS,
+            Self::Russian => russian::STRINGS,
+            Self::PortugueseBrazil => portuguese_brazil::STRINGS,
         }
     }
 
     pub fn update_via_winget_label(self) -> &'static str {
         match self {
             Self::English => english::UPDATE_VIA_WINGET_LABEL,
+            Self::Dutch => dutch::UPDATE_VIA_WINGET_LABEL,
             Self::Spanish => spanish::UPDATE_VIA_WINGET_LABEL,
             Self::French => french::UPDATE_VIA_WINGET_LABEL,
             Self::German => german::UPDATE_VIA_WINGET_LABEL,
             Self::Japanese => japanese::UPDATE_VIA_WINGET_LABEL,
+            Self::Korean => korean::UPDATE_VIA_WINGET_LABEL,
+            Self::TraditionalChinese => traditional_chinese::UPDATE_VIA_WINGET_LABEL,
+            Self::Russian => russian::UPDATE_VIA_WINGET_LABEL,
+            Self::PortugueseBrazil => portuguese_brazil::UPDATE_VIA_WINGET_LABEL,
         }
     }
 
@@ -74,12 +109,27 @@ impl LanguageId {
             return None;
         }
 
-        match normalized.split('-').next().unwrap_or_default() {
+        let prefix = normalized.split('-').next().unwrap_or_default();
+        match prefix {
             "en" => Some(Self::English),
+            "nl" => Some(Self::Dutch),
             "es" => Some(Self::Spanish),
             "fr" => Some(Self::French),
             "de" => Some(Self::German),
             "ja" => Some(Self::Japanese),
+            "ko" => Some(Self::Korean),
+            "zh" => {
+                if normalized.contains("tw")
+                    || normalized.contains("hk")
+                    || normalized.contains("hant")
+                {
+                    Some(Self::TraditionalChinese)
+                } else {
+                    None
+                }
+            }
+            "ru" => Some(Self::Russian),
+            "pt" => Some(Self::PortugueseBrazil),
             _ => None,
         }
     }
@@ -94,6 +144,10 @@ pub struct Strings {
     pub five_minutes: &'static str,
     pub fifteen_minutes: &'static str,
     pub one_hour: &'static str,
+    pub models: &'static str,
+    pub claude_code_model: &'static str,
+    pub codex_model: &'static str,
+    pub antigravity_model: &'static str,
     pub settings: &'static str,
     pub start_with_windows: &'static str,
     pub reset_position: &'static str,
@@ -111,6 +165,7 @@ pub struct Strings {
     pub update_available: &'static str,
     pub update_prompt_now: &'static str,
     pub exit: &'static str,
+    pub show_widget: &'static str,
     pub session_window: &'static str,
     pub weekly_window: &'static str,
     pub now: &'static str,
@@ -118,6 +173,14 @@ pub struct Strings {
     pub hour_suffix: &'static str,
     pub minute_suffix: &'static str,
     pub second_suffix: &'static str,
+    pub token_expired_title: &'static str,
+    pub token_expired_body: &'static str,
+    pub codex_token_expired_title: &'static str,
+    pub codex_token_expired_body: &'static str,
+    pub antigravity_token_expired_title: &'static str,
+    pub antigravity_token_expired_body: &'static str,
+    pub codex_window_title: &'static str,
+    pub antigravity_window_title: &'static str,
 }
 
 pub fn resolve_language(language_override: Option<LanguageId>) -> LanguageId {
